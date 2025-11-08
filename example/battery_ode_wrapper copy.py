@@ -21,7 +21,7 @@ class BatteryODEWrapper(nn.Module):
     Inputs:
         t       : current time [s] 
         x       : state vector [1x1] = [Vcorr]
-        inputs  : dict with time-varying inputs (V_ref(t), ocv(t), SOC(t), I(t), T(t))
+        inputs  : dict with time-varying inputs (I(t), T(t), csn_bulk(t))
         params  : neural network parameters (self.net)
     Output:
         dxdt    : time derivative of state vector [1x1] = [dVcorr/dt]
@@ -30,20 +30,17 @@ class BatteryODEWrapper(nn.Module):
     def __init__(self, device='cpu'):
         super(BatteryODEWrapper, self).__init__()
         
-        # Neural network: input [V_ref(t), ocv(t), Vcorr(t), SOC(t), I(t), T(t)] -> output dVcorr/dt
-        # 6 inputs: [V_ref_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k]
+        # Neural network: input [csn_bulk(t), I(t), T(t), Vcorr(t)] -> output dVcorr/dt
+        # 4 inputs: [Vcorr_k, csn_bulk, I, T]
         # 7 layers: original working version
         self.net = nn.Sequential(
-            # nn.Linear(6, 32),
-            # nn.Tanh(),
-            # nn.Linear(32, 32),
-            # nn.Tanh(),
-            # nn.Linear(32, 32),
-            # nn.Tanh(),
-            # nn.Linear(32, 16),
-            # nn.Tanh(),
-            # nn.Linear(16, 1)
-            nn.Linear(6, 16),
+            nn.Linear(4, 32),
+            nn.Tanh(),
+            nn.Linear(32, 32),
+            nn.Tanh(),
+            nn.Linear(32, 32),
+            nn.Tanh(),
+            nn.Linear(32, 16),
             nn.Tanh(),
             nn.Linear(16, 1)
         )
@@ -53,19 +50,13 @@ class BatteryODEWrapper(nn.Module):
             if isinstance(m, nn.Linear):
                 # nn.init.xavier_normal_(m.weight, gain=1.0)
                 # nn.init.constant_(m.bias, val=0)
-                nn.init.orthogonal_(m.weight, gain=0.7)  # Orthogonal!
+                nn.init.orthogonal_(m.weight, gain=0.5)  # Orthogonal!
                 nn.init.constant_(m.bias, 0)
         
         self.device = device
         
         # Store interpolation functions for time-varying inputs
         self.inputs_interp = None
-        
-        # Batch processing variables
-        self.inputs_batch = None
-        self.t_common = None
-        self.dt = None
-        self.batch_indices = None
         
         # Initialize step_count for tracking
         self.step_count = 0
@@ -79,90 +70,33 @@ class BatteryODEWrapper(nn.Module):
         Similar to MATLAB inputs struct with I(t), T(t), etc.
         
         Args:
-            inputs_dict: {'time': [...], 'V_ref': [...], 'ocv': [...], 'SOC': [...], 'I': [...], 'T': [...], 'V_spme': [...]}
+            inputs_dict: {'time': [...], 'I': [...], 'T': [...], 'csn_bulk': [...]}
         """
         time_data = inputs_dict['time']
         
         self.inputs_interp = {
-            'V_ref': interp1d(time_data, inputs_dict['V_ref'], kind='linear', fill_value='extrapolate'),
-            'ocv': interp1d(time_data, inputs_dict['ocv'], kind='linear', fill_value='extrapolate'),
-            'SOC': interp1d(time_data, inputs_dict['SOC'], kind='linear', fill_value='extrapolate'),
             'I': interp1d(time_data, inputs_dict['I'], kind='linear', fill_value='extrapolate'),
             'T': interp1d(time_data, inputs_dict['T'], kind='linear', fill_value='extrapolate'), 
+            'csn_bulk': interp1d(time_data, inputs_dict['csn_bulk'], kind='linear', fill_value='extrapolate'),
             'V_spme': interp1d(time_data, inputs_dict['V_spme'], kind='linear', fill_value='extrapolate'),
         }
         
         # # Reset prev_Vcorr when inputs change
         # self.prev_Vcorr = None
     
-    def set_inputs_batch(self, inputs_list, t_common):
-        """
-        Set up pre-interpolated inputs for batch processing
-        
-        Args:
-            inputs_list: List of dicts, each dict contains {'time', 'V_ref', 'ocv', 'SOC', 'I', 'T', 'V_spme'}
-                        One dict per profile in the batch
-            t_common: Common time vector [0, t_final] for all profiles (numpy array)
-        """
-        batch_size = len(inputs_list)
-        num_timesteps = len(t_common)
-        
-        # Store common time information
-        self.t_common = torch.tensor(t_common, dtype=torch.float32, device=self.device)
-        self.dt = (t_common[-1] - t_common[0]) / (num_timesteps - 1) if num_timesteps > 1 else 1.0
-        
-        # Pre-interpolate all inputs for all profiles
-        V_ref_batch = []
-        ocv_batch = []
-        SOC_batch = []
-        I_batch = []
-        T_batch = []
-        V_spme_batch = []
-        
-        for profile_data in inputs_list:
-            # Create interpolation for this profile
-            time_orig = profile_data['time']
-            
-            V_ref_interp = interp1d(time_orig, profile_data['V_ref'], kind='linear', fill_value='extrapolate')
-            ocv_interp = interp1d(time_orig, profile_data['ocv'], kind='linear', fill_value='extrapolate')
-            SOC_interp = interp1d(time_orig, profile_data['SOC'], kind='linear', fill_value='extrapolate')
-            I_interp = interp1d(time_orig, profile_data['I'], kind='linear', fill_value='extrapolate')
-            T_interp = interp1d(time_orig, profile_data['T'], kind='linear', fill_value='extrapolate')
-            V_spme_interp = interp1d(time_orig, profile_data['V_spme'], kind='linear', fill_value='extrapolate')
-            
-            # Evaluate at common time points
-            V_ref_batch.append(V_ref_interp(t_common))
-            ocv_batch.append(ocv_interp(t_common))
-            SOC_batch.append(SOC_interp(t_common))
-            I_batch.append(I_interp(t_common))
-            T_batch.append(T_interp(t_common))
-            V_spme_batch.append(V_spme_interp(t_common))
-        
-        # Convert to GPU tensors: shape (num_timesteps, batch_size)
-        self.inputs_batch = {
-            'V_ref': torch.tensor(np.array(V_ref_batch).T, dtype=torch.float32, device=self.device),
-            'ocv': torch.tensor(np.array(ocv_batch).T, dtype=torch.float32, device=self.device),
-            'SOC': torch.tensor(np.array(SOC_batch).T, dtype=torch.float32, device=self.device),
-            'I': torch.tensor(np.array(I_batch).T, dtype=torch.float32, device=self.device),
-            'T': torch.tensor(np.array(T_batch).T, dtype=torch.float32, device=self.device),
-            'V_spme': torch.tensor(np.array(V_spme_batch).T, dtype=torch.float32, device=self.device),
-        }
-        
-        print(f"✓ Batch inputs set: {batch_size} profiles, {num_timesteps} time steps")
-    
     def forward(self, t, x):
         """
-        ODE function called by odeint - supports both single and batch modes
+        ODE function called by odeint - mirrors MATLAB ode_wrapper_poly
         
-        Neural ODE: dVcorr/dt = f(V_ref, ocv, Vcorr, SOC, I, T)
+        Neural ODE: dVcorr/dt = f(Vcorr, csn_bulk, I, T)
         where f() is the neural network
         
         Args:
             t: current time (scalar)
-            x: state vector [Vcorr] (1x1 tensor for single, batch_size x 1 for batch)
+            x: state vector [Vcorr] (1x1 tensor)
             
         Returns:
-            dxdt: derivative [dVcorr/dt] (1x1 tensor for single, batch_size x 1 for batch)
+            dxdt: derivative [dVcorr/dt] (1x1 tensor)
         """
         # Convert time to scalar if needed
         if isinstance(t, torch.Tensor):
@@ -170,61 +104,27 @@ class BatteryODEWrapper(nn.Module):
         else:
             t_val = float(t)
 
-        # Check if batch mode
-        if self.inputs_batch is not None and self.t_common is not None:
-            # Batch mode
-            if isinstance(x, torch.Tensor):
-                Vcorr_k = x[:, 0]  # (batch_size,)
-            else:
-                Vcorr_k = x
-            
-            # Find time index for direct tensor access
-            t_idx = int((t_val - self.t_common[0].item()) / self.dt)
-            t_idx = max(0, min(t_idx, len(self.t_common) - 1))
-            
-            # Get inputs at time t for all profiles - GPU tensor indexing
-            if self.batch_indices is not None:
-                V_ref_k = self.inputs_batch['V_ref'][t_idx, self.batch_indices]
-                ocv_k = self.inputs_batch['ocv'][t_idx, self.batch_indices]
-                SOC_k = self.inputs_batch['SOC'][t_idx, self.batch_indices]
-                I_k = self.inputs_batch['I'][t_idx, self.batch_indices]
-                T_k = self.inputs_batch['T'][t_idx, self.batch_indices]
-            else:
-                V_ref_k = self.inputs_batch['V_ref'][t_idx, :]
-                ocv_k = self.inputs_batch['ocv'][t_idx, :]
-                SOC_k = self.inputs_batch['SOC'][t_idx, :]
-                I_k = self.inputs_batch['I'][t_idx, :]
-                T_k = self.inputs_batch['T'][t_idx, :]
-            
-            # Neural Network Input: X = [V_ref(k), ocv(k), Vcorr(k), SOC(k), I(k), T(k)] for all profiles
-            nn_input = torch.stack([V_ref_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k], dim=1)  # (batch_size, 6)
-            
-            # Neural Network Output: dVcorr/dt(k)
-            dVcorr_dt_k = self.net(nn_input)
-            
-        else:
-            # Single profile mode (original)
-            if isinstance(x, torch.Tensor):
-                Vcorr_k = x[0, 0].item()
-            else:
-                Vcorr_k = float(x)
+        # Extract current state: Vcorr(k)
+        Vcorr_k = x[0, 0].item() if isinstance(x, torch.Tensor) else float(x)
 
-            # Evaluate time-varying inputs at time t
-            if self.inputs_interp is None:
-                raise ValueError("Must call set_inputs() before solving ODE")
-                
-            V_ref_k = float(self.inputs_interp['V_ref'](t_val))    # Vref(k)
-            ocv_k = float(self.inputs_interp['ocv'](t_val))        # ocv(k)
-            SOC_k = float(self.inputs_interp['SOC'](t_val))         # SOC(k)
-            I_k = float(self.inputs_interp['I'](t_val))            # I(k)
-            T_k = float(self.inputs_interp['T'](t_val))              # T(k)
-            Vspme_k = float(self.inputs_interp['V_spme'](t_val))   # Vspme(k)
+
+        # Evaluate time-varying inputs at time t
+        if self.inputs_interp is None:
+            raise ValueError("Must call set_inputs() before solving ODE")
             
-            # Neural Network Input: X = [Vref(k), ocv(k), Vcorr(k), SOC(k), I(k), T(k)]
-            nn_input = torch.tensor([[V_ref_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k]], dtype=torch.float32, device=self.device)
-            
-            # Neural Network Output: dVcorr/dt(k)
-            dVcorr_dt_k = self.net(nn_input)
+        csn_k = float(self.inputs_interp['csn_bulk'](t_val))  # csn_bulk(k)
+        I_k = float(self.inputs_interp['I'](t_val))           # I(k)
+        T_k = float(self.inputs_interp['T'](t_val))           # T(k)
+        Vspme_k = float(self.inputs_interp['V_spme'](t_val))   # Vspme(k)
+        
+        # Neural Network Input: X = [Vcorr(k), csn_bulk(k), I(k), T(k)]
+        nn_input = torch.tensor([[Vcorr_k, csn_k, I_k, T_k]], dtype=torch.float32, device=self.device)
+        
+        # Neural Network Output: dVcorr/dt(k)
+        dVcorr_dt_k = self.net(nn_input)
+        
+        # 부호 반전 (처음에 방향 반대로 나와서 적용)
+        dVcorr_dt_k = dVcorr_dt_k
 
         self.step_count += 1
         
@@ -239,7 +139,7 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
     Train battery Neural ODE - mirrors MATLAB ode15s usage
     
     Args:
-        data_dict: {'time', 'V_ref', 'ocv', 'SOC', 'I', 'T', 'V_spme', 'V_meas'}
+        data_dict: {'time', 'csn_bulk', 'I', 'T', 'V_spme', 'V_meas'}
         num_epochs: number of training epochs
         lr: learning rate  
         device: device to use
@@ -401,8 +301,7 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
         loss_dVdt = torch.mean((dVdt_pred - dVdt_ref ) ** 2) # 기울기의 차이를 최소화
         loss_V = torch.mean((Vcorr_pred - Vcorr_target) ** 2) # 전압의 차이를 최소화
         loss_tv = torch.mean(torch.abs(torch.diff(Vcorr_pred))) # 전압의 변화량을 최소화
-        mae_V = torch.mean(torch.abs(Vcorr_pred - Vcorr_target))
-
+        
         loss = alpha * loss_V + beta * loss_dVdt + gamma * loss_tv
 
         
@@ -527,13 +426,14 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
     return ode_wrapper, history
 
 
+
 def simulate_battery_ode(ode_wrapper, data_dict, device='cuda', plot=True):
     """
     트레이닝된 모델로 시뮬레이션 실행
     
     Args:
         ode_wrapper: 트레이닝된 BatteryODEWrapper 모델
-        data_dict: {'time': [...], 'V_ref': [...], 'ocv': [...], 'SOC': [...], 'I': [...], 'T': [...], 
+        data_dict: {'time': [...], 'csn_bulk': [...], 'I': [...], 'T': [...], 
                    'Y_mean': float, 'Y_std': float, 'V_spme': [...]}
         device: device to use
         plot: plot results
@@ -547,11 +447,6 @@ def simulate_battery_ode(ode_wrapper, data_dict, device='cuda', plot=True):
     """
     # Set to evaluation mode
     ode_wrapper.eval()
-    
-    # Clear batch mode if it was used during training
-    ode_wrapper.inputs_batch = None
-    ode_wrapper.t_common = None
-    ode_wrapper.batch_indices = None
     
     # Set inputs for interpolation functions
     ode_wrapper.set_inputs(data_dict)
@@ -595,7 +490,16 @@ def simulate_battery_ode(ode_wrapper, data_dict, device='cuda', plot=True):
     
     # Calculate Vtotal
     if 'V_spme' in data_dict:
-        V_spme = np.array(data_dict['V_spme'])
+        V_spme_norm = np.array(data_dict['V_spme'])
+        
+        # De-normalize V_spme
+        if 'V_spme_mean' in data_dict and 'V_spme_std' in data_dict:
+            V_spme_mean = data_dict['V_spme_mean']
+            V_spme_std = data_dict['V_spme_std']
+            V_spme = V_spme_norm * V_spme_std + V_spme_mean
+        else:
+            V_spme = V_spme_norm
+            print("Warning: No V_spme_mean/V_spme_std found, using normalized V_spme")
         
         Vtotal_pred = V_spme + Vcorr_pred
     else:
@@ -738,18 +642,18 @@ def analyze_feature_importance(ode_wrapper, data_dict, device='cuda', verbose=Tr
     """
     Gradient-based feature importance analysis
     
-    각 feature (V_ref, ocv, Vcorr, SOC, I, T)에 대한 gradient magnitude를 계산하여
+    각 feature (Vcorr, csn_bulk, I, T)에 대한 gradient magnitude를 계산하여
     상대적 중요도를 평가합니다.
     
     Args:
         ode_wrapper: 트레이닝된 BatteryODEWrapper 모델
-        data_dict: {'time': [...], 'V_ref': [...], 'ocv': [...], 'SOC': [...], 'I': [...], 'T': [...], 
+        data_dict: {'time': [...], 'csn_bulk': [...], 'I': [...], 'T': [...], 
                    'Y_mean': float, 'Y_std': float, 'V_spme': [...]}
         device: device to use
         verbose: print results
     
     Returns:
-        importance_dict: {'V_ref': float, 'ocv': float, 'Vcorr': float, 'SOC': float, 'I': float, 'T': float}
+        importance_dict: {'Vcorr': float, 'csn_bulk': float, 'I': float, 'T': float}
                         각 feature의 상대적 중요도 (합계 = 1.0)
     """
     ode_wrapper.eval()
@@ -770,16 +674,14 @@ def analyze_feature_importance(ode_wrapper, data_dict, device='cuda', verbose=Tr
     
     # Storage for gradient magnitudes
     grad_magnitudes = {
-        'V_ref': [],
-        'ocv': [],
         'Vcorr': [],
-        'SOC': [],
+        'csn_bulk': [],
         'I': [],
         'T': []
     }
     
     # Feature names matching the input order
-    feature_names = ['V_ref', 'ocv', 'Vcorr', 'SOC', 'I', 'T']
+    feature_names = ['Vcorr', 'csn_bulk', 'I', 'T']
     
     # Compute gradients at sampled time points
     for t_val in t_sample:
@@ -788,11 +690,7 @@ def analyze_feature_importance(ode_wrapper, data_dict, device='cuda', verbose=Tr
         # Get current state (interpolate from solution or use target)
         with torch.no_grad():
             # Quick forward pass to get current Vcorr
-            V_ref_k = torch.tensor([[float(ode_wrapper.inputs_interp['V_ref'](t_val_scalar))]], 
-                                dtype=torch.float32, device=device)
-            ocv_k = torch.tensor([[float(ode_wrapper.inputs_interp['ocv'](t_val_scalar))]], 
-                                dtype=torch.float32, device=device)
-            SOC_k = torch.tensor([[float(ode_wrapper.inputs_interp['SOC'](t_val_scalar))]], 
+            csn_k = torch.tensor([[float(ode_wrapper.inputs_interp['csn_bulk'](t_val_scalar))]], 
                                 dtype=torch.float32, device=device)
             I_k = torch.tensor([[float(ode_wrapper.inputs_interp['I'](t_val_scalar))]], 
                               dtype=torch.float32, device=device)
@@ -809,15 +707,13 @@ def analyze_feature_importance(ode_wrapper, data_dict, device='cuda', verbose=Tr
                 Vcorr_k = x0_norm[0, 0:1]
         
         # Create input tensor that requires gradient
-        V_ref_k.requires_grad = True
-        ocv_k.requires_grad = True
         Vcorr_k.requires_grad = True
-        SOC_k.requires_grad = True
+        csn_k.requires_grad = True
         I_k.requires_grad = True
         T_k.requires_grad = True
         
-        # Concatenate features: [V_ref, ocv, Vcorr, SOC, I, T]
-        nn_input = torch.cat([V_ref_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k], dim=1)
+        # Concatenate features
+        nn_input = torch.cat([Vcorr_k, csn_k, I_k, T_k], dim=1)
         
         # Forward pass
         output = ode_wrapper.net(nn_input)
@@ -969,6 +865,19 @@ def struct_to_dataframe(mat_struct, selected_keys=None, add_vcorr=True):
         return pd.DataFrame()
 
 
+# Example usage (similar to MATLAB):
+"""
+# MATLAB equivalent:
+[t_sol, x_sol] = ode15s(@(t, x) ode_wrapper_poly(t, x, inputs, battery_params), inputs.t, x0, opts);
+
+# Python equivalent:
+ode_wrapper = BatteryODEWrapper(device)
+ode_wrapper.set_inputs(inputs_dict)
+solution = odeint(ode_wrapper, x0, t_eval)
+"""
+
+
+
 def smooth_Vcorr(Y, window_size=21):
     """
     Smooth Vcorr using Savitzky-Golay filter
@@ -996,6 +905,7 @@ def smooth_Vcorr(Y, window_size=21):
     return Y_smooth
 
 
+
 def compute_grad_norm(model):
     total_norm = 0.0
     for p in model.parameters():
@@ -1003,345 +913,3 @@ def compute_grad_norm(model):
             param_norm = p.grad.data.norm(2)
             total_norm += param_norm.item() ** 2
     return total_norm ** 0.5
-
-
-def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='cpu', verbose=True, training_batch_size=None, ode_wrapper=None, method='euler'):
-    """
-    Train battery Neural ODE on multiple profiles (batch version)
-    
-    Args:
-        data_list: List of data_dicts, each containing:
-                  {'time', 'V_ref', 'ocv', 'SOC', 'I', 'T', 'V_spme', 'Y', 'Y_mean', 'Y_std'}
-        num_epochs: number of training epochs
-        lr: learning rate  
-        device: device to use
-        verbose: print progress
-        training_batch_size: Number of profiles to use per training step (None = use all)
-        ode_wrapper: Optional pre-existing BatteryODEWrapper instance to continue training from
-        
-    Returns:
-        ode_wrapper: trained ODE wrapper
-        history: training history
-    """
-    import time
-    start_time = time.time()
-    
-    total_profiles = len(data_list)
-    training_batch_size = training_batch_size if training_batch_size is not None else total_profiles
-    training_batch_size = min(training_batch_size, total_profiles)
-    
-    print(f"\n{'='*60}")
-    print(f"Batch Training: {total_profiles} total profiles")
-    print(f"Training batch size: {training_batch_size} profiles per epoch")
-    print(f"{'='*60}")
-    
-    # Normalize each profile's time to start at 0
-    normalized_data_list = []
-    for data in data_list:
-        data_norm = data.copy()
-        t_orig = np.array(data['time'])
-        data_norm['time'] = t_orig - t_orig[0]
-        normalized_data_list.append(data_norm)
-    
-    # Find common time range and length after normalization
-    time_lengths = [len(data['time']) for data in normalized_data_list]
-    time_durations = [data['time'][-1] for data in normalized_data_list]
-    
-    print(f"Profile lengths: {time_lengths}")
-    print(f"Time durations: {[f'{d:.1f}s' for d in time_durations]}")
-    
-    max_length = max(time_lengths)
-    max_duration = max(time_durations)
-    
-    # Create common time vector
-    t_common = np.linspace(0, max_duration, max_length)
-    print(f"Common time vector: [0, {max_duration:.1f}] with {max_length} points")
-    
-    # Prepare inputs for batch processing
-    inputs_list = []
-    targets_list = []
-    Y_std_list = []
-    
-    for data in normalized_data_list:
-        inputs_list.append({
-            'time': data['time'],
-            'V_ref': data['V_ref'],
-            'ocv': data['ocv'],
-            'SOC': data['SOC'],
-            'I': data['I'],
-            'T': data['T'],
-            'V_spme': data['V_spme'],
-        })
-        targets_list.append(data['Y'])
-        Y_std_list.append(data['Y_std'])
-    
-    # Create ODE wrapper or use provided one
-    if ode_wrapper is None:
-        ode_wrapper = BatteryODEWrapper(device)
-        ode_wrapper = ode_wrapper.to(device)
-    else:
-        # Use provided wrapper and ensure it's on the correct device
-        ode_wrapper = ode_wrapper.to(device)
-        print(f"🔄 Using provided ODE wrapper for continued training")
-    
-    # Set batch inputs
-    ode_wrapper.set_inputs_batch(inputs_list, t_common)
-    
-    # Prepare targets as tensors with padding
-    targets_padded = []
-    valid_lengths = []
-    for target in targets_list:
-        original_length = len(target)
-        valid_lengths.append(original_length)
-        if len(target) < max_length:
-            padded = np.concatenate([target, np.full(max_length - len(target), target[-1])])
-        else:
-            padded = target[:max_length]
-        targets_padded.append(padded)
-    
-    targets_batch = torch.tensor(np.array(targets_padded), dtype=torch.float32, device=device)
-    
-    # Create mask for valid (non-padded) regions
-    valid_mask = torch.zeros((total_profiles, max_length), dtype=torch.bool, device=device)
-    for i, valid_len in enumerate(valid_lengths):
-        valid_mask[i, :valid_len] = True
-    
-    # Print Network Architecture
-    print("\n" + "="*60)
-    print("Neural Network Architecture")
-    print("="*60)
-    print(ode_wrapper.net)
-    print("="*60 + "\n")
-    
-    # Optimizer
-    optimizer = torch.optim.AdamW(ode_wrapper.parameters(), lr=lr, eps=1e-8, weight_decay=1e-4)
-    
-    # Scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=10,
-        min_lr=1e-10,
-        threshold=1e-3,
-        threshold_mode='rel'
-    )
-    
-    history = {
-        'loss': [],
-        'rmse': [],
-        'loss_V': [],
-        'loss_dVdt': [],
-        'grad_norm_before': [],
-        'grad_norm_after': [],
-    }
-    
-    # Best model tracking
-    best_rmse = float('inf')
-    best_model_state = None
-    best_epoch = 0
-    
-    epoch_window = 20
-    rmse_hist = deque(maxlen=epoch_window)
-    
-    # Parameters
-    alpha = 1
-    beta = 0
-    gamma = 0
-    gpu_mem = f"{torch.cuda.memory_allocated()/1024**2:.0f}MB" if device == 'cuda' else "N/A"
-    grad_clip_max = 50
-    
-    # Use average Y_std for normalization display
-    Y_std_avg = np.mean(Y_std_list)
-    
-    # Print Settings
-    print("="*60)
-    print("Training Settings")
-    print("="*60)
-    print(f"Total profiles: {total_profiles}")
-    print(f"Training batch size: {training_batch_size}")
-    print(f"Common time points: {max_length}")
-    print(f"Max epochs: {num_epochs}")
-    print(f"Initial LR: {lr}")
-    print(f"Device: {device}")
-    print(f"Patience: {scheduler.patience}")
-    print(f"Alpha: {alpha:.2f}, Beta: {beta:.2f}, Gamma: {gamma:.2f}")
-    print(f"GPU: {gpu_mem}")
-    print(f"Grad clip max: {grad_clip_max}")
-    print(f"Method: {method}")
-    print(f"Verbose: {verbose}")
-    print("="*60)
-    
-    if verbose:
-        print("Starting batch training...")
-        print(f"Targets shape: {targets_batch.shape}")
-        print(f"Target range: {targets_batch.min():.3f} ~ {targets_batch.max():.3f}")
-    
-    t_eval = torch.tensor(t_common, dtype=torch.float32, device=device)
-    
-    for epoch in range(num_epochs):
-        optimizer.zero_grad()
-        
-        # Sample random batch if training_batch_size < total_profiles
-        if training_batch_size < total_profiles:
-            selected_indices = np.random.choice(total_profiles, training_batch_size, replace=False)
-            batch_indices = torch.tensor(selected_indices, dtype=torch.long, device=device)
-        else:
-            batch_indices = None
-        
-        # Set batch indices for forward pass
-        ode_wrapper.batch_indices = batch_indices
-        
-        # Prepare initial conditions
-        if batch_indices is not None:
-            x0 = targets_batch[batch_indices, 0:1]
-        else:
-            x0 = targets_batch[:, 0:1]
-        
-        # ODE solving - BATCH!
-        ode_wrapper.step_count = 0
-        solution = odeint(ode_wrapper, x0, t_eval, method=method)
-        Vcorr_pred = solution[:, :, 0].T
-        
-        # Reset batch indices
-        ode_wrapper.batch_indices = None
-        
-        # Calculate loss
-        if batch_indices is not None:
-            targets_selected = targets_batch[batch_indices]
-            valid_mask_selected = valid_mask[batch_indices]
-        else:
-            targets_selected = targets_batch
-            valid_mask_selected = valid_mask
-        
-        # Apply mask to exclude padded regions from loss
-        Vcorr_pred_masked = Vcorr_pred * valid_mask_selected.float()
-        targets_masked = targets_selected * valid_mask_selected.float()
-        
-        # Loss calculation
-        loss_V = torch.tensor(0.0, device=device)
-        num_valid = 0
-        
-        for i in range(len(targets_selected)):
-            profile_valid_mask = valid_mask_selected[i, :].float()
-            num_valid_i = profile_valid_mask.sum()
-            if num_valid_i > 0:
-                loss_V += torch.sum((Vcorr_pred_masked[i, :] - targets_masked[i, :]) ** 2)
-                num_valid += num_valid_i
-        
-        if num_valid > 0:
-            loss_V = loss_V / num_valid
-        
-        dVdt_pred = torch.diff(Vcorr_pred, dim=1) / torch.diff(t_eval).unsqueeze(0)
-        dVdt_ref = torch.diff(targets_selected, dim=1) / torch.diff(t_eval).unsqueeze(0)
-        
-        valid_mask_diff = valid_mask_selected[:, :-1]
-        
-        loss_dVdt = torch.tensor(0.0, device=device)
-        num_valid_diff = 0
-        
-        for i in range(len(targets_selected)):
-            profile_valid_mask_diff = valid_mask_diff[i, :].float()
-            num_valid_diff_i = profile_valid_mask_diff.sum()
-            if num_valid_diff_i > 0:
-                loss_dVdt += torch.sum((dVdt_pred[i, :] - dVdt_ref[i, :]) ** 2 * profile_valid_mask_diff)
-                num_valid_diff += num_valid_diff_i
-        
-        if num_valid_diff > 0:
-            loss_dVdt = loss_dVdt / num_valid_diff
-        
-        # Total loss
-        loss_tv = torch.tensor(0.0, device=device)
-        loss = alpha * loss_V + beta * loss_dVdt + gamma * loss_tv
-        
-        # Backward
-        loss.backward()
-        grad_norm_before = compute_grad_norm(ode_wrapper)
-        torch.nn.utils.clip_grad_norm_(ode_wrapper.parameters(), max_norm=grad_clip_max)
-        grad_norm_after = compute_grad_norm(ode_wrapper)
-        
-        history['grad_norm_before'].append(grad_norm_before)
-        history['grad_norm_after'].append(grad_norm_after)
-        
-        optimizer.step()
-        
-        # History
-        rmse = torch.sqrt(loss_V).item()
-        history['loss'].append(loss.item())
-        history['loss_dVdt'].append(loss_dVdt.item())
-        history['loss_V'].append(loss_V.item())
-        history['rmse'].append(rmse)
-        
-        # Save best model
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_epoch = epoch
-            best_model_state = copy.deepcopy(ode_wrapper.state_dict())
-            print(f"✅ Best RMSE: {best_rmse * Y_std_avg * 1000:.2f}mV at Epoch {best_epoch+1}")
-        
-        # Update learning rate
-        scheduler.step(loss_V)
-        new_lr = optimizer.param_groups[0]['lr']
-        
-        # Print every epoch
-        if verbose:
-            print(f"Epoch {epoch+1:3d}/{num_epochs} | "
-                  f"Method: {method:6s} | "
-                  f"LR: {new_lr:.2e} | "
-                  f"RMSE: {rmse * Y_std_avg * 1000:.2f}mV | "
-                  f"loss_V: {loss_V.item():.4f} | "
-                  f"loss_dVdt: {loss_dVdt.item():.2e} | "
-                  f"Steps: {ode_wrapper.step_count:4d} | "
-                  f"Grad: {grad_norm_before:.2f} → {grad_norm_after:.2f}")
-        
-        # Early stopping
-        rmse_hist.append(rmse * Y_std_avg * 1000)
-        if len(rmse_hist) >= epoch_window:
-            if (max(rmse_hist) - min(rmse_hist)) <= 0.005:
-                print("Window range <= 0.005 mV → stop")
-                break
-    
-    # Load best model
-    if best_model_state is not None:
-        ode_wrapper.load_state_dict(best_model_state)
-        print(f"\n{'='*60}")
-        print(f"Training Complete!")
-        print(f"Loaded best model from epoch {best_epoch+1}/{num_epochs}")
-        print(f"Best RMSE: {best_rmse * Y_std_avg * 1000:.2f}mV")
-        best_model_path = f"best_model_batch_rmse{best_rmse * Y_std_avg * 1000:.2f}mV.pth"
-        
-        # Calculate total training time
-        total_training_time = time.time() - start_time
-        hours = int(total_training_time // 3600)
-        minutes = int((total_training_time % 3600) // 60)
-        seconds = int(total_training_time % 60)
-        time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-        
-        checkpoint = {
-            'model_state_dict': best_model_state,
-            'training_info': {
-                'best_rmse': best_rmse * Y_std_avg * 1000,
-                'best_epoch': best_epoch + 1,
-                'total_epochs': num_epochs,
-                'total_profiles': total_profiles,
-                'training_batch_size': training_batch_size,
-                'alpha': alpha,
-                'beta': beta,
-                'gamma': gamma,
-                'initial_lr': lr,
-                'max_epochs': num_epochs,
-                'patience': scheduler.patience,
-                'grad_clip_max': grad_clip_max,
-                'method': method,
-                'total_training_time_seconds': total_training_time,
-                'total_training_time_formatted': time_str,
-            },
-        }
-        torch.save(checkpoint, best_model_path)
-        print(f"Best model saved to: {best_model_path}")
-        print(f"Total training time: {time_str} ({total_training_time:.1f} seconds)")
-        print(f"{'='*60}\n")
-    
-    return ode_wrapper, history
-
-

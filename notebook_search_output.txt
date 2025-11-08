@@ -1,0 +1,378 @@
+=== Cell 11 ===
+import torch
+
+# 기존에 학습했던 best_model_batch_rmse1.83mV_6input_euler.pth 에서 가중치(state_dict)만 로드해서,
+# 이어서 연달아 트레이닝이 가능하도록 한다. (train_battery_neural_ode_batch에서 ode_wrapper를 새로 만들지만, 아래에서 덮어씀)
+
+# -- 1. 기존 모델 인스턴스 생성 (train 함수에서 생성된 것과 동일 방법, 즉 아래 두 줄 필요) --
+# device는 기존 코드처럼 정해진 상태여야 함
+from battery_ode_wrapper import BatteryODEWrapper
+ode_wrapper = BatteryODEWrapper(device=device).to(device)
+
+# -- 2. 기존 weight 로드 --
+checkpoint_path = 'best_model_batch_rmse1.83mV_6input_euler.pth'
+checkpoint = torch.load(checkpoint_path, map_location=device)
+
+if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+    ode_wrapper.load_state_dict(checkpoint['model_state_dict'])
+else:
+    ode_wrapper.load_state_dict(checkpoint)
+print(f"✓ Pretrained weights loaded from '{checkpoint_path}'.")
+
+# -- 3. 이어서 트레이닝 --
+# 학습 히스토리 및 optimizer 상태가 필요하면 checkpoint['optimizer_state_dict']에서 불러올 수 있지만,
+# 여기서는 네트워크 가중치만 이어받아, 아래처럼 ode_wrapper를 넣어줌. (초기 가중치로 사용)
+seed = 42 # 42 : Vcorr_k, csn_k, I_k, T_k,
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+np.random.seed(seed)
+random.seed(seed)
+torch.backends.cudnn.deterministic = True
+
+
+ode_wrapper, history = train_battery_neural_ode_batch(
+    data_list=training_dict_list,
+    num_epochs=num_epochs,
+    lr=lr,
+    device=device,
+    verbose=True,
+    training_batch_size=None,
+    ode_wrapper=ode_wrapper   # ← 기존 weight를 이어받아 다시 학습
+)
+
+
+==================================================
+
+=== Cell 12 ===
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from battery_ode_wrapper import BatteryODEWrapper
+from torchdiffeq import odeint
+
+# --- Load trained weights ---
+checkpoint_path = 'best_model_batch_rmse0.33mV.pth'
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+ode_wrapper_test = BatteryODEWrapper(device=device).to(device)
+checkpoint = torch.load(checkpoint_path, map_location=device)
+if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+    ode_wrapper_test.load_state_dict(checkpoint['model_state_dict'])
+else:
+    ode_wrapper_test.load_state_dict(checkpoint)
+ode_wrapper_test.eval()
+print(f"✓ Weights loaded for test from '{checkpoint_path}'.")
+
+# --- Run simulation on test_dict_list & compute timewise RMSE for each profile ---
+
+all_time = []
+rmse_over_time_profiles = []
+V_true_all = []  # Vtotal_target over time (V_spme + Vcorr_target, denorm)
+V_pred_all = []  # Vtotal_pred over time (V_spme + Vcorr_pred, denorm)
+Vcorr_true_all = []   # For plotting if needed
+Vcorr_pred_all = []
+Vref_all = []    # Vref (measured), denormalized if necessary
+
+for idx, data in enumerate(test_dict_list):
+    # Prepare input for wrapper, with denormalized values if model expects that
+    ode_wrapper_test.set_inputs(data)
+    t = np.array(data['time'])
+    t_tensor = torch.tensor(t, dtype=torch.float32, device=device)
+    x0 = torch.tensor([[data['Y'][0]]], dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        sol = odeint(ode_wrapper_test, x0, t_tensor, method='euler')
+        Vcorr_pred_norm = sol[:, 0, 0].cpu().numpy()
+
+    # Denormalize Vcorr
+    if 'Y_std' in data and 'Y_mean' in data:
+        Vcorr_pred = Vcorr_pred_norm * data['Y_std'] + data['Y_mean']
+        Vcorr_true = np.array(data['Y']) * data['Y_std'] + data['Y_mean']
+    else:
+        Vcorr_pred = Vcorr_pred_norm
+        Vcorr_true = np.array(data['Y'])
+
+    # Use provided V_spme, assume always denormalized (physical unit)
+    if 'V_spme' in data:
+        V_spme = np.array(data['V_spme'])
+    else:
+        raise ValueError("test_dict_list[{}] must have key 'V_spme'".format(idx))
+
+    Vtotal_pred = V_spme + Vcorr_pred
+    Vtotal_true = V_spme + Vcorr_true
+
+    # Collect Vref_raw, denormalized if necessary (for plotting total voltage)
+    if "Vref" in data:
+        vref = np.array(data["Vref"])
+        if "Vref_mean" in data and "Vref_std" in data:
+            vref = vref * data["Vref_std"] + data["Vref_mean"]
+        Vref_all.append(vref)
+    elif "V_meas" in data:
+        Vref_all.append(np.array(data["V_meas"]))
+    else:
+        Vref_all.append(np.zeros_like(t))  # fallback
+
+    # Store arrays
+    all_time.append(t)
+    V_true_all.append(Vtotal_true)
+    V_pred_all.append(Vtotal_pred)
+    Vcorr_true_all.append(Vcorr_true)
+    Vcorr_pred_all.append(Vcorr_pred)
+
+    # Timewise absolute error (for RMSE vs time curve): pred vs true
+    rmse_t = np.abs(Vtotal_pred - Vtotal_true)
+    rmse_over_time_profiles.append(rmse_t)
+
+# --------- 전체 RMSE (1개 per profile) 출력 ---------
+profilewise_rmse = [np.sqrt(np.mean((V_pred_all[i] - V_true_all[i]) ** 2)) for i in range(len(V_pred_all))]
+print("Per-profile RMSE (V) (Total Voltage = V_spme + Vcorr):")
+for i, r in enumerate(profilewise_rmse):
+    print(f"Profile {i}: {r:.6f} V ({r*1000:.2f} mV)")
+
+# --------- RMSE(t) min/median/max 플롯 ---------
+min_length = min(len(ti) for ti in all_time)
+shortest_idx = np.argmin([len(ti) for ti in all_time])
+common_time = all_time[shortest_idx]
+
+# Interpolate all error curves to this common_time for aggregation
+rmse_matrix = np.stack([
+    np.interp(common_time, all_time[i], rmse_over_time_profiles[i])
+    for i in range(len(rmse_over_time_profiles))
+], axis=0)  # shape = (num_profiles, num_timepoints)
+
+min_rmse = np.min(rmse_matrix, axis=0)
+median_rmse = np.median(rmse_matrix, axis=0)
+max_rmse = np.max(rmse_matrix, axis=0)
+
+plt.figure(figsize=(8,5))
+plt.plot(common_time, min_rmse, 'g-', label='Min |V_true - V_pred|')
+plt.plot(common_time, median_rmse, 'b-', label='Median |V_true - V_pred|')
+plt.plot(common_time, max_rmse, 'r-', label='Max |V_true - V_pred|')
+plt.fill_between(common_time, min_rmse, max_rmse, color='gray', alpha=0.13)
+plt.xlabel('Time (s)')
+plt.ylabel('Voltage Error (V)')
+plt.title('Total Voltage Error (min/median/max) vs Time (Test set)')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# --------- Vref & Vpred vs time for min/median/max RMSE profile ---------
+sorted_idx = np.argsort(profilewise_rmse)
+min_idx = int(sorted_idx[0])
+median_idx = int(sorted_idx[len(profilewise_rmse)//2])
+max_idx = int(sorted_idx[-1])
+chosen_indices = [min_idx, median_idx, max_idx]
+labels = ['Min RMSE', 'Median RMSE', 'Max RMSE']
+
+plt.figure(figsize=(18, 4.5))
+for i, idx_profile in enumerate(chosen_indices):
+    t = all_time[idx_profile]
+    Vref = Vref_all[idx_profile]
+    Vpred = V_pred_all[idx_profile]
+    plt.subplot(1, 3, i+1)
+    plt.plot(t, Vref, label="Vref (measured)", color='k', alpha=0.8)
+    plt.plot(t, Vpred, label="Vpred (V_spme + Vcorr_pred)", color='C1', alpha=0.8)
+    plt.xlabel('Time (s)')
+    plt.ylabel('Voltage (V)')
+    plt.title(f'Profile {idx_profile} ({labels[i]})\nRMSE={profilewise_rmse[idx_profile]*1000:.2f} mV')
+    if i == 0:
+        plt.legend()
+    plt.grid(alpha=0.35)
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+==================================================
+
+=== Cell 13 ===
+import plotly.graph_objs as go
+from plotly.subplots import make_subplots
+import numpy as np
+import torch
+
+# Assume: 
+# - "extracted_data" is a list of 8 dicts (the same format as normalized batch training input)
+# - "ode_wrapper" is the trained BatteryODEWrapper instance
+# - All data is on CPU, and torchdiffeq/odeint is available
+
+from torchdiffeq import odeint
+
+# 1. Run simulations for all profiles
+sim_V_preds = []
+sim_times = []
+sim_V_meas = []
+
+for idx, data in enumerate(extracted_data):
+    t = data['time']
+    x0 = np.array([data['Y'][0]], dtype=np.float32) # Initial normalized Vcorr
+
+    # Prepare inputs, using original (unnormalized) values for OCV, V_ref, SOC, I, T
+    input_for_sim = {
+        'time'   : data['time'],
+        'Vref'  : data['Vref'] * data['Vref_std'] + data['Vref_mean'],
+        'ocv'    : data['ocv'] * data['ocv_std'] + data['ocv_mean'],
+        'SOC'    : data['SOC'],  # assumed already 0~1
+        'I'      : data['I'] * 0.1,         # multiply by current_norm
+        'T'      : data['T'] * 10 + 298.15, # denormalize; temperature_norm, temperature_mean
+        'V_spme' : data['V_spme']
+    }
+    ode_wrapper.set_inputs(input_for_sim)
+    # Run odeint, input to model is normalized if it expects so (adapt accordingly)
+    t_tensor = torch.tensor(t, dtype=torch.float32)
+    x0_tensor = torch.tensor(x0, dtype=torch.float32)
+    y_pred = odeint(ode_wrapper, x0_tensor, t_tensor).squeeze().cpu().numpy()
+    # predicted Vcorr (normalized), recover to voltage unit
+    Vcorr_pred = y_pred * data['Y_std'] + data['Y_mean']            # model predicts Vcorr
+    V_spme = data['V_spme']                                         # original SPME voltage (already real voltage)
+    V_pred = V_spme + Vcorr_pred                                    # reconstruct predicted total voltage
+
+    sim_V_preds.append(V_pred)
+    sim_times.append(t)
+    sim_V_meas.append(data['V_meas'])
+
+# 2. Plotly interactive 8x1 subplot: pred (line), ground-truth (line)
+fig = make_subplots(rows=8, cols=1, shared_xaxes=False,
+                    subplot_titles=[f"Profile {i+1}" for i in range(8)],
+                    vertical_spacing=0.02)
+
+for idx in range(8):
+    fig.add_trace(go.Scatter(x=sim_times[idx], y=sim_V_meas[idx], 
+                             mode='lines', name=f"Measured {idx+1}",
+                             line=dict(color='black'), showlegend=(idx==0)),
+                  row=idx+1, col=1)
+    fig.add_trace(go.Scatter(x=sim_times[idx], y=sim_V_preds[idx],
+                             mode='lines', name=f"Predicted {idx+1}",
+                             line=dict(color='red'), showlegend=(idx==0)),
+                  row=idx+1, col=1)
+
+fig.update_layout(
+    height=2500,
+    width=1100,
+    title_text="Neural ODE Battery Simulation: Measured vs Predicted Voltage (All 8 Profiles)",
+)
+
+fig.update_xaxes(title_text="Time (s)")
+fig.update_yaxes(title_text="Voltage (V)")
+
+fig.show()
+
+# 3. Calculate RMSE in 3 SOC regions for all profiles
+rmse_by_region = {'[0.96,1.0]': [], '[0.12,0.96]': [], '[0,0.12]': []}
+
+for idx in range(8):
+    SOC = extracted_data[idx]['SOC']
+    y_true = sim_V_meas[idx]
+    y_pred = sim_V_preds[idx]
+    # Region 1: [0.96, 1.0]
+    mask1 = (SOC >= 0.96) & (SOC <= 1.0)
+    # Region 2: [0.12, 0.96]
+    mask2 = (SOC >= 0.12) & (SOC < 0.96)
+    # Region 3: [0.0, 0.12]
+    mask3 = (SOC >= 0.0) & (SOC < 0.12)
+
+    def safe_rmse(y1, y2):
+        if len(y1) == 0: return np.nan
+        return np.sqrt(np.mean((y1 - y2) ** 2)) * 1000  # mV
+
+    rmse1 = safe_rmse(y_true[mask1], y_pred[mask1])
+    rmse2 = safe_rmse(y_true[mask2], y_pred[mask2])
+    rmse3 = safe_rmse(y_true[mask3], y_pred[mask3])
+
+    rmse_by_region['[0.96,1.0]'].append(rmse1)
+    rmse_by_region['[0.12,0.96]'].append(rmse2)
+    rmse_by_region['[0,0.12]'].append(rmse3)
+
+# 4. Print RMSEs
+print("[RMSE by region for each profile] (in mV):")
+for region in ['[0.96,1.0]', '[0.12,0.96]', '[0,0.12]']:
+    vals = rmse_by_region[region]
+    # also print mean (ignoring nan)
+    avg = np.nanmean(vals)
+    slist = ", ".join([f"{v:.2f}" if not np.isnan(v) else "NaN" for v in vals])
+    print(f"{region} : [{slist}]  mean={avg:.2f} mV")
+
+
+==================================================
+
+=== Cell 16 ===
+from torchdiffeq import odeint
+import torch
+import numpy as np
+import pandas as pd
+
+# Assume BatteryODEWrapper is already defined in your context
+# and test_dict_list is loaded test data in list of dictionaries
+
+# Load the trained model checkpoint
+model_path = 'best_model_batch_rmse0.30mV.pth'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Instantiate model with the exact architecture used in training
+# Please set the hidden_dim, input_dim and any other required arguments exactly as in training
+
+ode_wrapper_test = BatteryODEWrapper(device=device)
+ode_wrapper_test.load_state_dict(torch.load(model_path, map_location=device))
+ode_wrapper_test.to(device)
+ode_wrapper_test.eval()
+
+# Run simulation on test data
+test_results = []
+
+for test_idx, test_data in enumerate(test_dict_list):
+    # Assuming test_data is a dict with keys matching the model's expectations
+    t = test_data['time']
+    x0 = np.array([test_data['Y'][0]], dtype=np.float32)  # Initial state for ODE, adapt if needed
+    # Prepare input features (update this to match your actual test input structure/order)
+        test_data['c_s_n_bulk']
+    ], axis=-1).astype(np.float32)
+    input_features = torch.tensor(input_features, dtype=torch.float32, device=device)
+
+    t_tensor = torch.tensor(t, dtype=torch.float32, device=device)
+    x0_tensor = torch.tensor(x0, dtype=torch.float32, device=device)
+    
+    # Simulate using the loaded model
+    with torch.no_grad():
+            # Set inputs for the wrapper
+    ode_wrapper_test.set_inputs(test_data)
+    
+    # Run simulation using odeint
+    with torch.no_grad():
+        sol = odeint(model, x0_tensor, t_tensor, method='euler')
+        pred = sol[:, 0, 0].cpu().numpy()
+        pred = pred.cpu().numpy().squeeze()
+    
+    test_results.append({
+        'profile': test_idx,
+        'time': t,
+        'Vcorr_pred': pred,
+        'Vcorr_true': test_data['Y'],
+    })
+
+# Display results
+# Example: show for the first test profile
+import matplotlib.pyplot as plt
+
+for result in test_results:
+    plt.figure(figsize=(10, 4))
+    plt.plot(result['time'], result['Vcorr_true'], label='True Vcorr')
+    plt.plot(result['time'], result['Vcorr_pred'], label='Predicted Vcorr', linestyle='--')
+    plt.title(f"Test Profile {result['profile']+1}: Vcorr Prediction")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Vcorr (V)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+==================================================
+
