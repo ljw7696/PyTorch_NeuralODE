@@ -8,6 +8,7 @@ from scipy.interpolate import interp1d
 from scipy.signal import savgol_filter
 import copy
 from collections import deque
+from pathlib import Path
 
 
 class BatteryODEWrapperJoint(nn.Module):
@@ -343,6 +344,17 @@ def train_battery_neural_ode_joint(data_list, num_epochs=100, lr=1e-3, device='c
         targets_list.append(data['Y'])
         Y_std_list.append(data['Y_std'])
     
+    # Allow passing a checkpoint path for the joint model
+    if isinstance(pretrained_joint_model, (str, Path)):
+        joint_model_path = str(pretrained_joint_model)
+        checkpoint = torch.load(pretrained_joint_model, map_location=device, weights_only=False)
+        model_instance = BatteryODEWrapperJoint(device).to(device)
+        state_dict = checkpoint["model_state_dict"] if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint else checkpoint
+        model_instance.load_state_dict(state_dict, strict=True)
+        pretrained_joint_model = model_instance
+        if verbose:
+            print(f"\n✅ Loaded pretrained joint model from {joint_model_path}")
+
     # Create ODE wrapper or use provided one
     if ode_wrapper is None:
         ode_wrapper = BatteryODEWrapperJoint(device)

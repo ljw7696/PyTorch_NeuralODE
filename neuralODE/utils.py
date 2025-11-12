@@ -177,8 +177,6 @@ def downsample_df(df_list, downsample_rate):
     return result_list
 
 
-
-
 def smooth_Vcorr(df_list, window_size=21):
     """
     Smooth Vcorr for a list of DataFrames using Savitzky-Golay filter.
@@ -429,6 +427,175 @@ def df2dict(df_driving_list, df_rest_list=None):
 
     # 최종 반환값: (운전자용 dict list, 휴식용 dict list) 튜플로 반환
     return dict_list_driving, dict_list_rest
+
+
+def downsample_evenly(dict_list, factor):
+    """
+    Downsample a list of profile dictionaries evenly by the given factor.
+
+    Args:
+        dict_list: list of dicts. Each dict contains time-series arrays with the
+                   same primary length (e.g. 'time', 'V_meas', 'SOC', ...).
+        factor: int >= 1. A factor of 2 keeps ~50% of the points, 3 keeps ~33%, etc.
+
+    Returns:
+        list of dicts with arrays downsampled along the first axis.
+    """
+    if not isinstance(dict_list, list):
+        raise ValueError("dict_list must be a list of dictionaries.")
+
+    if factor < 1:
+        raise ValueError("factor must be >= 1.")
+
+    if factor == 1:
+        # return shallow copies to avoid accidental in-place edits
+        return [copy.deepcopy(profile) for profile in dict_list]
+
+    downsampled_list = []
+
+    for profile in dict_list:
+        if not isinstance(profile, dict):
+            raise ValueError("Each item in dict_list must be a dictionary.")
+
+        # Determine original length using 'time' if available, otherwise the first array-like entry.
+        length = None
+        time_values = profile.get("time", None)
+
+        if isinstance(time_values, np.ndarray) and time_values.ndim > 0:
+            length = len(time_values)
+        elif torch.is_tensor(time_values) and time_values.ndim > 0:
+            length = time_values.shape[0]
+        elif isinstance(time_values, (list, tuple)):
+            length = len(time_values)
+
+        if length is None:
+            # fallback: find first array-like value
+            for value in profile.values():
+                if isinstance(value, np.ndarray) and value.ndim > 0:
+                    length = len(value)
+                    break
+                if torch.is_tensor(value) and value.ndim > 0:
+                    length = value.shape[0]
+                    break
+                if isinstance(value, (list, tuple)) and len(value) > 0:
+                    length = len(value)
+                    break
+
+        if length is None or length == 0:
+            # nothing to downsample
+            downsampled_list.append(copy.deepcopy(profile))
+            continue
+
+        target_len = max(1, int(np.ceil(length / factor)))
+        if target_len >= length:
+            downsampled_list.append(copy.deepcopy(profile))
+            continue
+
+        idx = np.linspace(0, length - 1, num=target_len, endpoint=True, dtype=np.int64)
+
+        def _downsample_value(val):
+            if isinstance(val, np.ndarray):
+                if val.ndim == 0:
+                    return val
+                valid_idx = idx[idx < val.shape[0]]
+                return val[valid_idx]
+            if torch.is_tensor(val):
+                if val.ndim == 0:
+                    return val
+                valid_idx = idx[idx < val.shape[0]]
+                if len(valid_idx) == 0:
+                    return val[:1]
+                index_tensor = torch.as_tensor(valid_idx, device=val.device, dtype=torch.long)
+                return val.index_select(0, index_tensor)
+            if isinstance(val, list):
+                return [val[i] for i in idx if i < len(val)]
+            if isinstance(val, tuple):
+                return tuple(val[i] for i in idx if i < len(val))
+            # leave scalars / unknown types untouched
+            return val
+
+        new_profile = {}
+        for key, value in profile.items():
+            new_profile[key] = _downsample_value(value)
+
+        downsampled_list.append(new_profile)
+
+    return downsampled_list
+
+
+def zero_order_hold_dict_list(dict_list, hold_factor, keys_to_hold=None):
+    """
+    Apply zero-order hold to selected entries in a list of profile dictionaries.
+
+    Args:
+        dict_list: list of dicts containing profile data.
+        hold_factor: number of samples per hold segment (>=1).
+        keys_to_hold: iterable of keys to process. If None, all array-like entries
+                      are held.
+
+    Returns:
+        List of dicts with zero-order held values.
+    """
+    if not isinstance(dict_list, list):
+        raise ValueError("dict_list must be a list of dictionaries.")
+    if hold_factor < 1:
+        raise ValueError("hold_factor must be >= 1.")
+
+    held_list = []
+    target_keys = set(keys_to_hold) if keys_to_hold is not None else None
+
+    for profile in dict_list:
+        if not isinstance(profile, dict):
+            raise ValueError("Each item in dict_list must be a dictionary.")
+
+        new_profile = copy.deepcopy(profile)
+
+        for key, value in profile.items():
+            if target_keys is not None and key not in target_keys:
+                continue
+
+            if isinstance(value, np.ndarray):
+                if value.ndim == 0 or value.size == 0 or hold_factor == 1:
+                    continue
+                held = value.copy()
+                for start in range(0, len(held), hold_factor):
+                    held[start:start + hold_factor] = held[start]
+                new_profile[key] = held
+
+            elif torch.is_tensor(value):
+                if value.ndim == 0 or value.numel() == 0 or hold_factor == 1:
+                    continue
+                held = value.clone()
+                length = held.shape[0]
+                for start in range(0, length, hold_factor):
+                    held[start:start + hold_factor] = held[start]
+                new_profile[key] = held
+
+            elif isinstance(value, list):
+                if len(value) == 0 or hold_factor == 1:
+                    continue
+                held = value[:]
+                for start in range(0, len(held), hold_factor):
+                    segment_value = held[start]
+                    end = min(start + hold_factor, len(held))
+                    for idx in range(start, end):
+                        held[idx] = segment_value
+                new_profile[key] = held
+
+            elif isinstance(value, tuple):
+                if len(value) == 0 or hold_factor == 1:
+                    continue
+                held_list_tuple = list(value)
+                for start in range(0, len(held_list_tuple), hold_factor):
+                    segment_value = held_list_tuple[start]
+                    end = min(start + hold_factor, len(held_list_tuple))
+                    for idx in range(start, end):
+                        held_list_tuple[idx] = segment_value
+                new_profile[key] = tuple(held_list_tuple)
+
+        held_list.append(new_profile)
+
+    return held_list
 
 
 
