@@ -34,18 +34,18 @@ class BatteryODEWrapper(nn.Module):
         # 6 inputs: [V_ref_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k]
         # 7 layers: original working version
         self.net = nn.Sequential(
-            # nn.Linear(6, 32),
-            # nn.Tanh(),
-            # nn.Linear(32, 32),
-            # nn.Tanh(),
-            # nn.Linear(32, 32),
-            # nn.Tanh(),
-            # nn.Linear(32, 16),
-            # nn.Tanh(),
-            # nn.Linear(16, 1)
-            nn.Linear(6, 16),
+            nn.Linear(6, 32),
+            nn.Tanh(),
+            nn.Linear(32, 32),
+            nn.Tanh(),
+            nn.Linear(32, 32),
+            nn.Tanh(),
+            nn.Linear(32, 16),
             nn.Tanh(),
             nn.Linear(16, 1)
+            # nn.Linear(6, 16),
+            # nn.Tanh(),
+            # nn.Linear(16, 1)
         )
         
         # Initialize weights

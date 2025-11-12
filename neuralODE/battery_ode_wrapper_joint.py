@@ -50,12 +50,11 @@ class BatteryODEWrapperJoint(nn.Module):
             nn.Linear(16, 1)
         )
         
-        # Gating layer: 3 → 8 → 1
-        # Input: [driving_output, rest_output, I_k]
+        # Gating layer: I_k^2 → σ(w * I_k^2 + b)
+        # Produces scalar gate to mix driving/rest outputs
         self.gating_layer = nn.Sequential(
-            nn.Linear(3, 8),
-            nn.Tanh(),
-            nn.Linear(8, 1)
+            nn.Linear(1, 1),  # w*I² + b (2개 파라미터)
+            nn.Sigmoid()       # σ(w*I² + b)
         )
         
         # Initialize weights
@@ -220,9 +219,9 @@ class BatteryODEWrapperJoint(nn.Module):
             driving_output = self.driving_net(nn_input)  # (batch_size, 1)
             rest_output = self.rest_net(nn_input)        # (batch_size, 1)
             
-            # Gating layer: combines [driving_output, rest_output, I_k]
-            gating_input = torch.cat([driving_output, rest_output, I_k.unsqueeze(1)], dim=1)  # (batch_size, 3)
-            dVcorr_dt_k = self.gating_layer(gating_input)  # (batch_size, 1)
+            # Gating layer: computes gate from I_k^2
+            gate = self.gating_layer(I_k.unsqueeze(1) ** 2)  # (batch_size, 1)
+            dVcorr_dt_k = gate * driving_output + (1 - gate) * rest_output
             
         else:
             # Single profile mode (original)
@@ -249,9 +248,9 @@ class BatteryODEWrapperJoint(nn.Module):
             driving_output = self.driving_net(nn_input)  # (1, 1)
             rest_output = self.rest_net(nn_input)        # (1, 1)
             
-            # Gating layer: combines [driving_output, rest_output, I_k]
-            gating_input = torch.cat([driving_output, rest_output, torch.tensor([[I_k]], device=self.device)], dim=1)  # (1, 3)
-            dVcorr_dt_k = self.gating_layer(gating_input)  # (1, 1)
+            # Gating layer: computes gate from I_k^2
+            gate = self.gating_layer(torch.tensor([[I_k ** 2]], dtype=torch.float32, device=self.device))  # (1, 1)
+            dVcorr_dt_k = gate * driving_output + (1 - gate) * rest_output
 
         self.step_count += 1
         
