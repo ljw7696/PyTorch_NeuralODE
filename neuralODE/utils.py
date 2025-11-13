@@ -767,48 +767,72 @@ def split_df(list_of_df, window_minutes=30, time_col='time', random_seed=None):
     return return_list
 
 
-def split_train_test(dict_list, train_ratio=0.8):
+def split_train_val_test(dict_list, train_ratio=0.6, val_ratio=0.2, test_ratio=0.2):
     """
-    Split a list of dicts into training and test sets with random shuffling.
+    Split a list of dicts into training, validation, and test sets with random shuffling.
     
     Args:
         dict_list: list of dicts to split
-        train_ratio: float, ratio of training data (default=0.8)
+        train_ratio: float, ratio of training data (default=0.6)
+        val_ratio: float, ratio of validation data (default=0.2)
+        test_ratio: float, ratio of test data (default=0.2)
     
     Returns:
         training_dict_list: list of dicts for training
+        validation_dict_list: list of dicts for validation
         test_dict_list: list of dicts for testing
     """
     if not isinstance(dict_list, list):
         raise ValueError("Input must be a list")
     
     if len(dict_list) == 0:
-        return [], []
+        return [], [], []
     
-    if not 0 < train_ratio <= 1:
-        raise ValueError("train_ratio must be between 0 and 1")
+    # Check if ratios sum to 1.0 (allow small floating point errors)
+    total_ratio = train_ratio + val_ratio + test_ratio
+    if not (0.99 <= total_ratio <= 1.01):
+        raise ValueError(f"Ratios must sum to 1.0, got {total_ratio:.3f}")
+    
+    # Allow val_ratio=0 (no validation set)
+    # But train_ratio and test_ratio must be > 0
+    if train_ratio <= 0 or test_ratio <= 0:
+        raise ValueError("train_ratio and test_ratio must be > 0")
+    if val_ratio < 0 or val_ratio >= 1:
+        raise ValueError("val_ratio must be >= 0 and < 1")
+    if train_ratio >= 1 or test_ratio >= 1:
+        raise ValueError("train_ratio and test_ratio must be < 1")
     
     print("="*50)
-    print("Starting 'split_train_test()'")
+    print("Starting 'split_train_val_test()'")
     print(f"Total length of dict: {len(dict_list)}")
+    print(f"Split ratios: Train={train_ratio:.1%}, Val={val_ratio:.1%}, Test={test_ratio:.1%}")
     
     # Random shuffle
     shuffled_indices = np.random.permutation(len(dict_list))
-    split_idx = int(train_ratio * len(dict_list))
     
-    # Split into training and test
-    training_dict_list = [dict_list[i] for i in shuffled_indices[:split_idx]]
-    test_dict_list = [dict_list[i] for i in shuffled_indices[split_idx:]]
+    # Calculate split indices
+    train_idx = int(train_ratio * len(dict_list))
+    val_idx = train_idx + int(val_ratio * len(dict_list)) if val_ratio > 0 else train_idx
+    
+    # Split into training, validation, and test
+    training_dict_list = [dict_list[i] for i in shuffled_indices[:train_idx]]
+    if val_ratio > 0:
+        validation_dict_list = [dict_list[i] for i in shuffled_indices[train_idx:val_idx]]
+    else:
+        validation_dict_list = []  # Empty list if val_ratio=0
+    test_dict_list = [dict_list[i] for i in shuffled_indices[val_idx:]]
     
     train_percent = (len(training_dict_list) / len(dict_list)) * 100
+    val_percent = (len(validation_dict_list) / len(dict_list)) * 100
     test_percent = (len(test_dict_list) / len(dict_list)) * 100
     
     print(f"Number of train dict: {len(training_dict_list)} ({train_percent:.1f}%)")
+    print(f"Number of val dict: {len(validation_dict_list)} ({val_percent:.1f}%)")
     print(f"Number of test dict: {len(test_dict_list)} ({test_percent:.1f}%)")
-    print("split_train_test() completed")
+    print("split_train_val_test() completed")
     print("="*50)
     
-    return training_dict_list, test_dict_list
+    return training_dict_list, validation_dict_list, test_dict_list
 
 
 

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+import sys
 import time
 import numpy as np
 import torch
@@ -31,6 +32,12 @@ def _build_mlp(
     output_dim: int,
     activation: nn.Module = nn.Tanh(),
 ) -> nn.Sequential:
+    """
+    Build a multi-layer perceptron (MLP).
+    
+    Uses PyTorch's default initialization (Kaiming uniform for Linear layers).
+    This matches the previous working setup.
+    """
     layers = []
     prev_dim = input_dim
     for hidden_dim in hidden_dims:
@@ -38,28 +45,36 @@ def _build_mlp(
         layers.append(activation)
         prev_dim = hidden_dim
     layers.append(nn.Linear(prev_dim, output_dim))
-    return nn.Sequential(*layers)
+    net = nn.Sequential(*layers)
+    
+    # Use PyTorch's default initialization (Kaiming uniform for Linear layers)
+    # This matches the previous working setup where no explicit initialization was used
+    
+    return net
 
 
 class DNNBenchmark(nn.Module):
     """
-    Feed-forward network that mirrors the Neural ODE driving head.
+    Feed-forward network that predicts Vcorr(k+1) directly in denormalized space (physical units, mV).
+    This approach worked well previously despite teacher forcing vs autoregressive mismatch.
+    Uses mixed normalization: V_ref, ocv, I, T are normalized, but Vcorr is denormalized (mV).
     """
 
     def __init__(self, input_dim: int = DEFAULT_INPUT_DIM):
         super().__init__()
         self.net = _build_mlp(
             input_dim=input_dim,
-            hidden_dims=(32, 32, 32, 16),
+            hidden_dims=(32, 32, 32, 16),  # Original architecture (matches saved checkpoint)
             output_dim=1,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: shape (..., input_dim)
+            x: shape (..., input_dim) containing [V_ref, ocv, Vcorr, SOC, I, T]
+               where V_ref, ocv, I, T are normalized, but Vcorr is denormalized (mV)
         Returns:
-            (..., 1) predicted Vcorr(k+1)
+            (..., 1) predicted Vcorr(k+1) in denormalized space (physical units, mV)
         """
         return self.net(x)
 
@@ -79,6 +94,13 @@ def _extract_features_and_targets(
     """
     Convert a profile dict to feature matrix [T, 6], Vcorr vector [T],
     V_spme vector [T], and V_meas vector [T].
+    
+    Features use mixed normalization (previous working approach):
+    - V_ref, ocv, I, T: normalized (different scales)
+    - Vcorr: denormalized (physical units, mV) - small range, stable
+    - SOC: already normalized (0~1)
+    
+    Returns denormalized Vcorr for training targets and RMSE calculation.
     """
     V_ref = _resolve_array(profile, "V_ref")
     if V_ref is None:
@@ -91,25 +113,31 @@ def _extract_features_and_targets(
     v_spme = _resolve_array(profile, "V_spme")
     v_meas = _resolve_array(profile, "V_meas")
 
+    # Get denormalized Vcorr for features (previous working approach)
     vcorr = _resolve_array(profile, "Vcorr")
     if vcorr is None:
-        Y_norm = _resolve_array(profile, "Y")
-        if Y_norm is not None and "Y_mean" in profile and "Y_std" in profile:
-            vcorr = Y_norm * float(profile["Y_std"]) + float(profile["Y_mean"])
-        elif v_meas is not None and v_spme is not None:
+        # Try to compute from V_meas/V_spme
+        if v_meas is not None and v_spme is not None:
             vcorr = v_meas - v_spme
         else:
-            raise KeyError(
-                "Profile must contain Vcorr information: provide 'Vcorr', "
-                "'Y' with stats, or both 'V_meas' and 'V_spme'."
-            )
+            # Try to get from normalized Y and denormalize
+            Y_norm = _resolve_array(profile, "Y")
+            if Y_norm is not None and "Y_mean" in profile and "Y_std" in profile:
+                Y_mean = float(profile["Y_mean"])
+                Y_std = float(profile["Y_std"])
+                vcorr = Y_norm * Y_std + Y_mean  # Denormalize
+            else:
+                raise KeyError(
+                    "Profile must contain 'Vcorr', 'Y' with 'Y_mean' and 'Y_std', "
+                    "or both 'V_meas' and 'V_spme'."
+                )
 
-    if any(arr is None for arr in (V_ref, ocv, vcorr, soc, current, temperature, v_spme, v_meas)):
+    if any(arr is None for arr in (V_ref, ocv, soc, current, temperature, v_spme, v_meas, vcorr)):
         missing = [
             name
             for name, arr in zip(
-                ["V_ref/V_meas", "ocv", "Vcorr", "SOC", "I", "T", "V_spme", "V_meas"],
-                (V_ref, ocv, vcorr, soc, current, temperature, v_spme, v_meas),
+                ["V_ref/V_meas", "ocv", "SOC", "I", "T", "V_spme", "V_meas", "Vcorr"],
+                (V_ref, ocv, soc, current, temperature, v_spme, v_meas, vcorr),
             )
             if arr is None
         ]
@@ -121,11 +149,13 @@ def _extract_features_and_targets(
     if min_len < 2:
         raise ValueError("Each profile must contain at least two time steps.")
 
+    # Features use denormalized Vcorr (previous working approach)
+    # Other features (V_ref, ocv, I, T) are normalized, but Vcorr is denormalized
     features = np.stack(
         [
             V_ref[:min_len],
             ocv[:min_len],
-            vcorr[:min_len],
+            vcorr[:min_len],  # Denormalized Vcorr (physical units, mV)
             soc[:min_len],
             current[:min_len],
             temperature[:min_len],
@@ -141,6 +171,10 @@ def _extract_features_and_targets(
 class SingleStepDataset(Dataset):
     """
     Dataset for one-step predictors such as DNNBenchmark.
+    
+    Uses mixed normalization (previous working approach):
+    - Input features: V_ref, ocv, I, T normalized; Vcorr denormalized (physical units)
+    - Targets: denormalized Vcorr(k+1) (physical units, mV)
     """
 
     def __init__(self, profiles: Sequence[dict]):
@@ -148,10 +182,17 @@ class SingleStepDataset(Dataset):
         ys: List[np.ndarray] = []
         v_spme_next: List[np.ndarray] = []
         v_meas_next: List[np.ndarray] = []
-        for profile in profiles:
+        
+        for profile_idx, profile in enumerate(profiles):
             features, vcorr, v_spme, v_meas = _extract_features_and_targets(profile)
+            
+            # Features contain denormalized Vcorr at position 2
+            # Targets should be denormalized Vcorr(k+1)
+            # features: [V_ref, ocv, Vcorr, SOC, I, T] where Vcorr is denormalized
+            # targets: Vcorr(k+1) denormalized
+            
             xs.append(features[:-1])
-            ys.append(vcorr[1:, None])
+            ys.append(vcorr[1:, None])  # Denormalized Vcorr(k+1) as target
             v_spme_next.append(v_spme[1:, None])
             v_meas_next.append(v_meas[1:, None])
 
@@ -449,13 +490,14 @@ def _load_pretrained_state(model: nn.Module, pretrained_path: Optional[Union[str
 
 
 def train_dnn_benchmark(
-    dict_list: Sequence[dict],
+    train_dict_list: Sequence[dict],
     num_epochs: int,
     lr: float,
     device: Union[str, torch.device],
     training_batch_size: Optional[int],
     num_workers: int,
     *,
+    val_dict_list: Optional[Sequence[dict]] = None,
     pretrained_model_path: Optional[Union[str, Path]] = None,
     save_path: Optional[Union[str, Path]] = None,
     clip_grad_norm: float = 50.0,
@@ -468,6 +510,11 @@ def train_dnn_benchmark(
 ) -> BenchmarkTrainingSummary:
     """
     Train the DNN benchmark model using the provided profile dict list.
+    
+    Args:
+        train_dict_list: List of dicts for training
+        val_dict_list: Optional list of dicts for validation. If provided, validation
+                      will be performed each epoch and used for model selection and early stopping.
     """
     torch.backends.cudnn.benchmark = True
     if hasattr(torch, "set_float32_matmul_precision"):
@@ -475,11 +522,23 @@ def train_dnn_benchmark(
 
     device = _resolve_device(device)
 
-    dataset = build_dnn_dataset(dict_list)
-    effective_batch_size = training_batch_size if training_batch_size is not None else len(dataset)
+    # Training dataset and loader
+    if verbose:
+        print(f"[DNN] Building training dataset from {len(train_dict_list)} profiles...")
+        sys.stdout.flush()  # Force flush to show progress immediately
+    
+    train_dataset = build_dnn_dataset(train_dict_list)
+    effective_batch_size = training_batch_size if training_batch_size is not None else len(train_dataset)
     drop_last = training_batch_size is not None
-    loader = DataLoader(
-        dataset,
+    num_batches = len(train_dataset) // effective_batch_size + (1 if len(train_dataset) % effective_batch_size != 0 else 0)
+    
+    if verbose:
+        print(f"[DNN] Training dataset size: {len(train_dataset)} samples")
+        print(f"[DNN] Batch size: {effective_batch_size}, Num batches: {num_batches}")
+        sys.stdout.flush()
+    
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=effective_batch_size,
         shuffle=True,
         drop_last=drop_last,
@@ -487,9 +546,45 @@ def train_dnn_benchmark(
         pin_memory=device.type == "cuda",
         persistent_workers=num_workers > 0,
     )
+    
+    # Note: Using denormalized Vcorr for targets (previous working approach)
+    # No need for Y_std_avg since we work in physical units
+    
+    # Validation dataset and loader (if provided)
+    val_loader = None
+    if val_dict_list is not None and len(val_dict_list) > 0:
+        if verbose:
+            print(f"[DNN] Building validation dataset from {len(val_dict_list)} profiles...")
+            sys.stdout.flush()
+        val_dataset = build_dnn_dataset(val_dict_list)
+        if verbose:
+            print(f"[DNN] Validation dataset size: {len(val_dataset)} samples")
+            sys.stdout.flush()
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=effective_batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=num_workers,
+            pin_memory=device.type == "cuda",
+            persistent_workers=num_workers > 0,
+        )
+    elif val_dict_list is not None and len(val_dict_list) == 0:
+        if verbose:
+            print(f"[DNN] Validation dataset is empty (len=0), skipping validation.")
+            sys.stdout.flush()
 
+    if verbose:
+        print(f"[DNN] Initializing model...")
+        sys.stdout.flush()
     model = DNNBenchmark().to(device)
     _load_pretrained_state(model, pretrained_model_path)
+    
+    if verbose:
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[DNN] Model parameters: {total_params:,} total, {trainable_params:,} trainable")
+        sys.stdout.flush()
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -507,36 +602,86 @@ def train_dnn_benchmark(
         threshold_mode="rel",
     )
     criterion = torch.nn.MSELoss()
+    
+    if verbose:
+        print(f"[DNN] Starting training for {num_epochs} epochs...")
+        print(f"[DNN] Device: {device}, Learning rate: {lr:.6f}")
+        print("=" * 80)
+        sys.stdout.flush()
 
-    best_rmse = float("inf")
+    best_rmse = float("inf")  # RMSE in mV (denormalized space)
     best_epoch = -1
     best_state_dict = None
     history: Dict[str, List[float]] = {
         "epoch": [],
-        "loss": [],
-        "rmse_mV": [],
+        "train_loss": [],
+        "train_rmse_mV": [],
+        "val_loss": [],
+        "val_rmse_mV": [],
         "lr": [],
         "grad_before": [],
         "grad_after": [],
     }
     rmse_window = deque(maxlen=early_stop_window)
+    use_validation = val_loader is not None
 
     for epoch in range(1, num_epochs + 1):
+        # ===== Training Phase =====
         model.train()
-        running_loss = 0.0
-        voltage_sse = 0.0
-        sample_count = 0
+        train_running_loss = 0.0
+        train_sample_count = 0
         grad_norm_before = 0.0
         grad_norm_after = 0.0
+        
+        if verbose and epoch == 1:
+            print(f"[DNN] Starting epoch {epoch}/{num_epochs}...")
+            sys.stdout.flush()
 
-        for xb, yb, v_spme_next, v_meas_next in loader:
+        for batch_idx, (xb, yb, v_spme_next, v_meas_next) in enumerate(train_loader):
+            # Show progress for first epoch (first few batches)
+            if verbose and epoch == 1 and batch_idx < 3:
+                total_batches = len(train_loader)
+                print(f"[DNN] Processing batch {batch_idx + 1}/{total_batches}...")
+                sys.stdout.flush()
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
-            v_spme_next = v_spme_next.to(device, non_blocking=True)
-            v_meas_next = v_meas_next.to(device, non_blocking=True)
 
-            preds = model(xb)
-            loss = criterion(preds, yb)
+            # Direct prediction of Vcorr(k+1) in denormalized space (previous working approach)
+            preds = model(xb)  # Vcorr(k+1) prediction in denormalized space (mV)
+            
+            # Debug: check Y (normalized Vcorr) range in flat OCV region (first batch of first epoch only)
+            if epoch == 1 and batch_idx == 0:
+                # Convert to Y (normalized Vcorr) for analysis
+                # Y = (Vcorr - Y_mean) / Y_std
+                # Get Y_mean and Y_std from profile (assume same for all in batch, use first profile's values)
+                # Note: xb[:, 2] is Vcorr (denormalized, mV), yb is Vcorr(k+1) (denormalized, mV)
+                vcorr_input = xb[:, 2].cpu().numpy()  # Vcorr(k) denormalized
+                vcorr_target = yb.cpu().numpy().flatten()  # Vcorr(k+1) denormalized
+                soc_values = xb[:, 3].cpu().numpy()  # SOC
+                
+                # Assume Y_mean and Y_std (from df2dict: Y_mean=-0.015, Y_std=0.004)
+                Y_mean = -0.015
+                Y_std = 0.004
+                
+                # Convert to Y (normalized)
+                Y_input = (vcorr_input - Y_mean) / Y_std
+                Y_target = (vcorr_target - Y_mean) / Y_std
+                
+                # Flat OCV region: SOC = [0.11, 0.96]
+                flat_mask = (soc_values >= 0.11) & (soc_values <= 0.96)
+                Y_flat_input = Y_input[flat_mask]
+                Y_flat_target = Y_target[flat_mask]
+                
+                print(f"[DNN] First batch:")
+                print(f"  Input Vcorr(k): [{vcorr_input.min():.3f}, {vcorr_input.max():.3f}] mV")
+                print(f"  Target Vcorr(k+1): [{vcorr_target.min():.3f}, {vcorr_target.max():.3f}] mV")
+                if len(Y_flat_input) > 0:
+                    print(f"  Y (norm) in flat region [11-96% SOC]:")
+                    print(f"    Input Y(k): [{Y_flat_input.min():.2f}, {Y_flat_input.max():.2f}], std: {Y_flat_input.std():.2f}")
+                    print(f"    Target Y(k+1): [{Y_flat_target.min():.2f}, {Y_flat_target.max():.2f}], std: {Y_flat_target.std():.2f}")
+                print(f"  Predicted Vcorr(k+1): [{preds.min():.3f}, {preds.max():.3f}] mV, Loss: {criterion(preds, yb).item():.6f}")
+            
+            loss = criterion(preds, yb)  # Loss in denormalized space (physical units, mV)
             optimizer.zero_grad()
             loss.backward()
 
@@ -556,47 +701,103 @@ def train_dnn_benchmark(
 
             optimizer.step()
 
-            running_loss += loss.item() * xb.size(0)
-            voltage_sse += torch.sum((v_spme_next + preds.detach() - v_meas_next) ** 2).item()
-            sample_count += xb.size(0)
+            train_running_loss += loss.item() * xb.size(0)
+            train_sample_count += xb.size(0)
 
-        epoch_loss = running_loss / len(loader.dataset)
-        epoch_rmse = (voltage_sse / sample_count) ** 0.5
-        scheduler.step(epoch_loss)
+        train_epoch_loss = train_running_loss / len(train_loader.dataset)
+        
+        # Calculate RMSE in denormalized space (physical units, mV)
+        train_rmse_mV = (train_running_loss / len(train_loader.dataset)) ** 0.5 * 1000  # Convert to mV
 
-        avg_grad_before = grad_norm_before / len(loader)
-        avg_grad_after = grad_norm_after / len(loader)
+        avg_grad_before = grad_norm_before / len(train_loader)
+        avg_grad_after = grad_norm_after / len(train_loader)
+
+        # ===== Validation Phase =====
+        val_epoch_loss = None
+        val_epoch_rmse_mV = None
+        if use_validation:
+            model.eval()
+            val_running_loss = 0.0
+            
+            with torch.no_grad():
+                # Use batch processing with teacher forcing (fast, same as training)
+                # This is faster than autoregressive rollout and gives consistent validation metrics
+                for xb, yb, v_spme_next, v_meas_next in val_loader:
+                    xb = xb.to(device, non_blocking=True)
+                    yb = yb.to(device, non_blocking=True)
+                    
+                    # Direct prediction of Vcorr(k+1) in denormalized space (same as training)
+                    preds = model(xb)  # Vcorr(k+1) prediction in denormalized space (mV)
+                    loss = criterion(preds, yb)  # Loss in denormalized space (physical units, mV)
+                    
+                    val_running_loss += loss.item() * xb.size(0)
+            
+            # Calculate RMSE in denormalized space (physical units, mV)
+            val_epoch_loss = val_running_loss / len(val_loader.dataset)
+            val_epoch_rmse_mV = (val_epoch_loss) ** 0.5 * 1000  # Convert to mV
+        
+        # Use validation metrics for scheduler and model selection if available, otherwise use training metrics
+        monitor_loss = val_epoch_loss if use_validation else train_epoch_loss
+        scheduler.step(monitor_loss)
 
         history["epoch"].append(epoch)
-        history["loss"].append(epoch_loss)
-        history["rmse_mV"].append(epoch_rmse * 1e3)
+        history["train_loss"].append(train_epoch_loss)
+        history["train_rmse_mV"].append(train_rmse_mV)  # RMSE in mV (denormalized space)
+        history["val_loss"].append(val_epoch_loss if val_epoch_loss is not None else float("nan"))
+        history["val_rmse_mV"].append(val_epoch_rmse_mV if val_epoch_rmse_mV is not None else float("nan"))  # RMSE in mV (denormalized space)
         history["lr"].append(optimizer.param_groups[0]["lr"])
         history["grad_before"].append(avg_grad_before)
         history["grad_after"].append(avg_grad_after)
 
+        # Print every epoch if verbose
         if verbose:
-            print(
-                f"[DNN] epoch {epoch}/{num_epochs}, "
-                f"loss={epoch_loss:.3e}, "
-                f"RMSE={epoch_rmse*1e3:.2f} mV, "
-                f"LR={optimizer.param_groups[0]['lr']:.3e}, "
-                f"Grad={avg_grad_before:.3e}->{avg_grad_after:.3e}"
-            )
+            if use_validation:
+                print(
+                    f"[DNN] epoch {epoch}/{num_epochs}, "
+                    f"train_loss={train_epoch_loss:.3e}, train_RMSE={train_rmse_mV:.2f} mV, "
+                    f"val_loss={val_epoch_loss:.3e}, val_RMSE={val_epoch_rmse_mV:.2f} mV, "
+                    f"LR={optimizer.param_groups[0]['lr']:.3e}, "
+                    f"Grad={avg_grad_before:.3e}->{avg_grad_after:.3e}"
+                )
+            else:
+                print(
+                    f"[DNN] epoch {epoch}/{num_epochs}, "
+                    f"loss={train_epoch_loss:.3e}, "
+                    f"RMSE={train_rmse_mV:.2f} mV, "
+                    f"LR={optimizer.param_groups[0]['lr']:.3e}, "
+                    f"Grad={avg_grad_before:.3e}->{avg_grad_after:.3e}"
+                )
 
-        rmse_window.append(epoch_rmse * 1e3)
-        if epoch_rmse < best_rmse:
-            best_rmse = epoch_rmse
+        # Use RMSE in denormalized space (physical units, mV)
+        # All calculations in denormalized space
+        
+        # Best model selection: use validation if available (to prevent overfitting)
+        if use_validation and val_epoch_rmse_mV is not None:
+            best_monitor_rmse_mV = val_epoch_rmse_mV  # Already in mV
+            best_metric_name = "val_RMSE"
+        else:
+            best_monitor_rmse_mV = train_rmse_mV  # Already in mV
+            best_metric_name = "RMSE"
+        
+        # Early stopping: use training RMSE (more stable, reflects actual learning progress)
+        early_stop_monitor_rmse_mV = train_rmse_mV  # Always use training RMSE for early stopping
+        
+        # Update best model based on validation (if available) or training
+        rmse_window.append(early_stop_monitor_rmse_mV)  # Early stopping uses training RMSE
+        if best_monitor_rmse_mV < best_rmse:
+            best_rmse = best_monitor_rmse_mV
             best_epoch = epoch
             best_state_dict = copy.deepcopy(model.state_dict())
             if verbose:
-                print(f"[DNN] ✅ Best RMSE improved to {best_rmse*1e3:.2f} mV at epoch {epoch}")
+                print(f"[DNN] ✅ Best {best_metric_name} improved to {best_monitor_rmse_mV:.2f} mV at epoch {epoch}")
 
+        # Early stopping based on training RMSE (more stable)
         if (
             rmse_window.maxlen == len(rmse_window)
             and (max(rmse_window) - min(rmse_window)) <= early_stop_delta_mV
         ):
             if verbose:
-                print(f"[DNN] Early stopping triggered (ΔRMSE <= {early_stop_delta_mV:.3f} mV over {early_stop_window} epochs)")
+                print(f"[DNN] Early stopping triggered (Δtrain_RMSE <= {early_stop_delta_mV:.3f} mV over {early_stop_window} epochs)")
             break
 
     if best_state_dict is None:
@@ -612,10 +813,10 @@ def train_dnn_benchmark(
         "architecture": repr(model),
         "num_epochs": num_epochs,
         "lr": lr,
-        "batch_size": training_batch_size or len(loader.dataset),
+        "batch_size": training_batch_size or len(train_loader.dataset),
         "num_workers": num_workers,
         "best_epoch": best_epoch,
-        "best_rmse_mV": best_rmse * 1e3,
+        "best_rmse_mV": best_rmse,  # Already in mV (denormalized space)
         "history": history,
     }
     torch.save(payload, save_path)
@@ -627,16 +828,18 @@ def train_dnn_benchmark(
         state_dict_path=save_path,
         num_epochs=num_epochs,
         lr=lr,
-        batch_size=training_batch_size or len(loader.dataset),
+        batch_size=training_batch_size or len(train_loader.dataset),
         num_workers=num_workers,
         best_epoch=best_epoch,
-        best_rmse_mV=best_rmse * 1e3,
+        best_rmse_mV=best_rmse,  # Already in mV (denormalized space)
         history=history,
     )
 
     if verbose:
         print(f"[DNN] Best RMSE = {summary.best_rmse_mV:.2f} mV at epoch {summary.best_epoch}")
-        print(f"[DNN] Saved best model to {summary.state_dict_path}")
+        print(f"[DNN] Architecture:")
+        print(summary.architecture)
+        print(f"[DNN] Saved best model to: {summary.state_dict_path}")
 
     return summary
 
@@ -685,6 +888,7 @@ def _dnn_autoregressive_rollout(
     model: DNNBenchmark,
     features: np.ndarray,
     device: torch.device,
+    debug: bool = False,
 ) -> np.ndarray:
     """
     Perform an autoregressive rollout over a single profile.
@@ -692,31 +896,60 @@ def _dnn_autoregressive_rollout(
     Args:
         model: trained DNNBenchmark
         features: np.ndarray shape [T, 6] as returned by _extract_features_and_targets
+                 Contains mixed normalization: [V_ref, ocv, Vcorr, SOC, I, T]
+                 where V_ref, ocv, I, T are normalized, but Vcorr is denormalized (mV)
         device: torch device
+        debug: if True, print debug info for first 3 steps
     Returns:
-        np.ndarray shape [T] with predicted Vcorr in physical units (denormalized)
+        np.ndarray shape [T] with predicted Vcorr in physical units (denormalized, mV)
     """
     seq_len = features.shape[0]
-    static_features = torch.from_numpy(features).to(device)
+    static_features = torch.from_numpy(features).to(device, dtype=torch.float32)
     pred_vcorr = torch.zeros(seq_len, dtype=torch.float32, device=device)
-    pred_vcorr[0] = static_features[0, 2]
+    pred_vcorr[0] = static_features[0, 2]  # Initial condition: denormalized Vcorr (mV)
 
     with torch.no_grad():
         for k in range(seq_len - 1):
             input_vec = torch.stack(
                 [
-                    static_features[k, 0],  # V_ref or V_meas
-                    static_features[k, 1],  # ocv
-                    pred_vcorr[k],          # autoregressive Vcorr(k)
-                    static_features[k, 3],  # SOC
-                    static_features[k, 4],  # current
-                    static_features[k, 5],  # temperature
+                    static_features[k, 0],  # V_ref (normalized)
+                    static_features[k, 1],  # ocv (normalized)
+                    pred_vcorr[k],           # autoregressive Vcorr(k) (denormalized, mV)
+                    static_features[k, 3],  # SOC (normalized)
+                    static_features[k, 4],  # current (normalized)
+                    static_features[k, 5],  # temperature (normalized)
                 ]
             ).unsqueeze(0)
-            pred_next = model(input_vec).squeeze(0).squeeze(0)
-            pred_vcorr[k + 1] = pred_next
+            # Direct prediction of Vcorr(k+1) in denormalized space (previous working approach)
+            pred_vcorr_kp1 = model(input_vec).squeeze(0).squeeze(0)
+            # Debug: check for NaN or Inf
+            if torch.isnan(pred_vcorr_kp1) or torch.isinf(pred_vcorr_kp1):
+                raise ValueError(f"NaN or Inf detected in pred_vcorr at k={k}")
+            
+            # Direct prediction: Vcorr(k+1) = predicted directly (denormalized, mV)
+            pred_vcorr[k + 1] = pred_vcorr_kp1
+            
+            # Debug: print first few steps if requested (only for first profile)
+            if debug and k < 3:
+                actual_vcorr_k = static_features[k, 2].item()
+                actual_vcorr_kp1 = static_features[k+1, 2].item() if k+1 < seq_len else None
+                pred_vcorr_k = pred_vcorr[k].item()
+                pred_vcorr_kp1 = pred_vcorr_kp1.item()
+                vcorr_error = pred_vcorr_k - actual_vcorr_k
+                pred_error = pred_vcorr_kp1 - actual_vcorr_kp1 if actual_vcorr_kp1 is not None else None
+                
+                if k == 0:
+                    print(f"  Step | Pred Vcorr(k) | Actual Vcorr(k) | Error | Pred Vcorr(k+1) | Actual Vcorr(k+1) | Pred Error")
+                    print(f"  {'-'*95}")
+                
+                pred_error_str = f"{pred_error:+.6f}" if pred_error is not None else "N/A"
+                actual_vcorr_kp1_str = f"{actual_vcorr_kp1:.6f}" if actual_vcorr_kp1 is not None else "N/A"
+                print(f"  {k:4d} | {pred_vcorr_k:13.6f} | {actual_vcorr_k:14.6f} | {vcorr_error:+6.6f} | "
+                      f"{pred_vcorr_kp1:15.6f} | {actual_vcorr_kp1_str:17s} | {pred_error_str}")
 
-    return pred_vcorr.detach().cpu().numpy()
+    # Return denormalized Vcorr (already in physical units, mV)
+    pred_vcorr_np = pred_vcorr.detach().cpu().numpy()
+    return pred_vcorr_np
 
 
 def run_dnn_benchmark_inference(
@@ -740,27 +973,41 @@ def run_dnn_benchmark_inference(
 
     for idx, profile in enumerate(dict_list):
         features, _, v_spme, v_meas = _extract_features_and_targets(profile)
-        pred_vcorr = _dnn_autoregressive_rollout(model, features, device)
+        
+        # Debug only for first profile
+        debug = (idx == 0)
+        if debug:
+            print(f"[DEBUG] Profile #{idx} (first 3 steps):")
+        # Note: features already contains denormalized Vcorr at position 2
+        pred_vcorr = _dnn_autoregressive_rollout(model, features, device, debug=debug)
+        if debug:
+            print()  # Empty line after debug output
 
         time_values = _resolve_array(profile, "time")
         soc_values = _resolve_array(profile, "SOC")
         profile_name = _resolve_profile_name(profile, fallback=f"profile_{idx}")
 
-        v_pred = v_spme + pred_vcorr
+        # Calculate V_pred = V_spme + Vcorr_pred (denormalized)
+        # pred_vcorr is already denormalized from _dnn_autoregressive_rollout
+        v_pred = v_spme + pred_vcorr  # V_pred = V_spme + Vcorr_pred (denormalized)
         squared_error = np.sum((v_pred - v_meas) ** 2)
         rmse = float(np.sqrt(np.mean((v_pred - v_meas) ** 2)))
 
         total_squared_error += squared_error
         total_points += len(v_meas)
+        
+        # Print RMSE for first few profiles for debugging
+        if idx < 3:
+            print(f"  Profile #{idx} RMSE: {rmse*1e3:.2f} mV")
 
         results.append(
             {
                 "profile_index": idx,
                 "profile_name": profile_name,
                 "time": time_values,
-                "V_meas": v_meas,
-                "V_spme": v_spme,
-                "Vcorr_pred": pred_vcorr,
+                "V_meas": v_meas,  # Already denormalized (original)
+                "V_spme": v_spme,  # Already denormalized
+                "Vcorr_pred": pred_vcorr,  # Only Vcorr prediction (denormalized), not including v_spme
                 "SOC": soc_values,
                 "rmse": rmse,
             }
