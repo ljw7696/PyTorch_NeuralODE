@@ -1,14 +1,16 @@
+import math
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import pandas as pd
-from torchdiffeq import odeint
+from torchdiffeq import odeint_adjoint as odeint
 from scipy.interpolate import interp1d
 from scipy.signal import savgol_filter
 import copy
 from collections import deque
-
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 
 class BatteryODEWrapper(nn.Module):
@@ -969,31 +971,6 @@ def struct_to_dataframe(mat_struct, selected_keys=None, add_vcorr=True):
         return pd.DataFrame()
 
 
-def smooth_Vcorr(Y, window_size=21):
-    """
-    Smooth Vcorr using Savitzky-Golay filter
-    
-    Args:
-        Y: array-like, Vcorr data to smooth
-        window_size: int, window length (must be odd, default=21)
-    
-    Returns:
-        Y_smooth: smoothed Vcorr data
-    """
-    # Ensure window_size is odd
-    if window_size % 2 == 0:
-        window_size += 1
-        print(f"Warning: window_size must be odd. Using {window_size} instead.")
-    
-    # Smooth
-    Y_smooth = savgol_filter(
-        Y,
-        window_length=window_size,
-        polyorder=3,
-        mode='interp'
-    )
-    
-    return Y_smooth
 
 
 def compute_grad_norm(model):
@@ -1345,3 +1322,236 @@ def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='c
     return ode_wrapper, history
 
 
+
+
+def test_battery_neural_ode_batch(
+    data_list: Sequence[dict],
+    checkpoint_path: Union[str, Path],
+    device: Union[str, torch.device] = "cuda",
+    method: str = "euler",
+    batch_size: Optional[int] = None,
+    verbose: bool = True,
+    save_path: Optional[Union[str, Path]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Run batch inference with a pretrained Neural ODE checkpoint (same batching as training).
+
+    Args:
+        data_list: list of profile dicts (same format as train_battery_neural_ode_batch)
+        checkpoint_path: path to checkpoint (e.g. "best_model_batch_rmse1.63mV.pth")
+        device: torch device
+        method: ODE solver method ("euler", "rk4", ...)
+        batch_size: optional profile batch size; None = all at once
+        verbose: print progress
+
+    Returns:
+        preds_denorm_list: list of predicted Vcorr (denormalized) per profile
+        targets_denorm_list: list of ground-truth Vcorr (denormalized) per profile
+        vtotal_pred_list: list of predicted Vtotal (V_spme + Vcorr) per profile
+        vtotal_gt_list: list of measured Vtotal (V_meas) per profile
+    """
+    device = torch.device(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint["model_state_dict"]
+    training_info = checkpoint.get("training_info", {})
+
+    if verbose:
+        print(f"\n[TEST] Loading checkpoint: {checkpoint_path}")
+        if training_info:
+            print("  --- Checkpoint Training Info ---")
+            for key in sorted(training_info.keys()):
+                print(f"  {key}: {training_info[key]}")
+        else:
+            print("  (no training_info metadata found)")
+        if "network_architecture" in checkpoint:
+            print("  --- Network Architecture ---")
+            print(checkpoint["network_architecture"])
+        print("=" * 60)
+
+    # Create wrapper and load weights
+    ode_wrapper = BatteryODEWrapper(device=device).to(device)
+    ode_wrapper.load_state_dict(state_dict)
+    ode_wrapper.eval()
+
+    total_profiles = len(data_list)
+    batch_size = batch_size or total_profiles
+    batch_size = min(batch_size, total_profiles)
+
+    if verbose:
+        print(f"[TEST] Total profiles to evaluate: {total_profiles}")
+
+    results: List[Dict[str, Any]] = []
+    rmse_vcorr_list: List[float] = []
+    rmse_vtotal_list: List[float] = []
+    processed_profiles = 0
+    progress_step = max(1, math.ceil(total_profiles * 0.1))
+    next_progress = progress_step
+
+    # Normalize each profile time to start at zero (same as training)
+    normalized_list = []
+    for profile in data_list:
+        profile_norm = profile.copy()
+        t_arr = np.array(profile["time"])
+        profile_norm["time"] = t_arr - t_arr[0]
+        normalized_list.append(profile_norm)
+
+    # Process in batches
+    for start in range(0, total_profiles, batch_size):
+        end = min(start + batch_size, total_profiles)
+        batch_profiles = normalized_list[start:end]
+
+        # Find max length and duration for this batch
+        lengths = [len(p["time"]) for p in batch_profiles]
+        durations = [p["time"][-1] for p in batch_profiles]
+        max_len = max(lengths)
+        max_duration = max(durations)
+        t_common = np.linspace(0, max_duration, max_len)
+        t_eval = torch.tensor(t_common, dtype=torch.float32, device=device)
+
+        # Prepare inputs for batch solver (same as training)
+        inputs_list = []
+        targets_list = []
+        v_spme_list = []
+        v_meas_list = []
+        y_mean_list = []
+        y_std_list = []
+
+        for prof in batch_profiles:
+            inputs_list.append({
+                "time": prof["time"],
+                "V_ref": prof["V_ref"],
+                "ocv": prof["ocv"],
+                "SOC": prof["SOC"],
+                "I": prof["I"],
+                "T": prof["T"],
+                "V_spme": prof["V_spme"],
+            })
+            targets_list.append(prof["Y"])
+            v_spme_list.append(prof.get("V_spme"))
+            v_meas_list.append(prof.get("V_meas"))
+            y_mean_list.append(prof.get("Y_mean"))
+            y_std_list.append(prof.get("Y_std"))
+
+        ode_wrapper.set_inputs_batch(inputs_list, t_common)
+        ode_wrapper.batch_indices = None  # use full batch
+
+        # Initial conditions (normalized Y)
+        targets_padded = []
+        valid_lengths = []
+        for target in targets_list:
+            valid_lengths.append(len(target))
+            if len(target) < max_len:
+                padded = np.concatenate([target, np.full(max_len - len(target), target[-1])])
+            else:
+                padded = target[:max_len]
+            targets_padded.append(padded)
+        targets_batch = torch.tensor(np.array(targets_padded), dtype=torch.float32, device=device)
+        x0 = targets_batch[:, 0:1]
+
+        with torch.no_grad():
+            ode_wrapper.step_count = 0
+            solution = odeint(ode_wrapper, x0, t_eval, method=method)  # [T, batch, 1]
+            pred_norm = solution[:, :, 0].T  # [batch, T]
+
+        # Unpad / denormalize per profile
+        for idx, prof in enumerate(batch_profiles):
+            global_idx = start + idx
+            valid_len = valid_lengths[idx]
+            y_mean = y_mean_list[idx]
+            y_std = y_std_list[idx]
+            pred_norm_profile = pred_norm[idx, :valid_len].cpu().numpy()
+            targ_norm_profile = np.array(targets_list[idx][:valid_len])
+
+            if y_mean is None or y_std is None:
+                pred_denorm = pred_norm_profile
+                targ_denorm = targ_norm_profile
+            else:
+                pred_denorm = pred_norm_profile * y_std + y_mean
+                targ_denorm = targ_norm_profile * y_std + y_mean
+
+            if v_spme_list[idx] is not None:
+                v_spme = np.array(v_spme_list[idx][:valid_len])
+                vtotal_pred = v_spme + pred_denorm
+            else:
+                v_spme = None
+                vtotal_pred = None
+
+            if v_meas_list[idx] is not None:
+                v_meas = np.array(v_meas_list[idx][:valid_len])
+                vtotal_gt = v_meas
+            else:
+                v_meas = None
+                vtotal_gt = None
+
+            rmse_vcorr = float(np.sqrt(np.mean((pred_denorm - targ_denorm) ** 2)) * 1000)
+            rmse_vtotal = (
+                float(np.sqrt(np.mean((vtotal_pred - vtotal_gt) ** 2)) * 1000)
+                if vtotal_pred is not None and vtotal_gt is not None
+                else None
+            )
+
+            rmse_vcorr_list.append(rmse_vcorr)
+            if rmse_vtotal is not None:
+                rmse_vtotal_list.append(rmse_vtotal)
+
+            results.append(
+                {
+                    "profile_index": global_idx,
+                    "time": prof["time"][:valid_len],
+                    "Vcorr_pred": pred_denorm,
+                    "Vcorr_target": targ_denorm,
+                    "Vtotal_pred": vtotal_pred,
+                    "Vtotal_target": vtotal_gt,
+                    "V_meas": v_meas,
+                    "V_spme": v_spme,
+                    "SOC": np.array(prof.get("SOC", [np.nan] * valid_len))[:valid_len],
+                    "rmse_vcorr_mV": rmse_vcorr,
+                    "rmse_vtotal_mV": rmse_vtotal,
+                    "num_points": valid_len,
+                }
+            )
+            processed_profiles += 1
+
+            if verbose and processed_profiles >= next_progress:
+                pct = min(100, int(round(processed_profiles / total_profiles * 100)))
+                print(f"[TEST] Progress: {processed_profiles}/{total_profiles} profiles ({pct}%)")
+                next_progress += progress_step
+
+        if verbose and results:
+            last_rmse = results[-1]["rmse_vcorr_mV"]
+            print(f"[TEST] Profiles {start}-{end - 1}: last RMSE = {last_rmse:.2f} mV")
+
+    summary: Dict[str, Any] = {
+        "num_profiles": total_profiles,
+        "avg_rmse_vcorr_mV": float(np.mean(rmse_vcorr_list)) if rmse_vcorr_list else float("nan"),
+        "median_rmse_vcorr_mV": float(np.median(rmse_vcorr_list)) if rmse_vcorr_list else float("nan"),
+        "avg_rmse_vtotal_mV": float(np.mean(rmse_vtotal_list)) if rmse_vtotal_list else None,
+        "median_rmse_vtotal_mV": float(np.median(rmse_vtotal_list)) if rmse_vtotal_list else None,
+        "checkpoint_path": str(checkpoint_path),
+        "solver": method,
+        "batch_size": batch_size,
+    }
+
+    if verbose:
+        print(f"[TEST] Completed {total_profiles} profiles (batch_size={batch_size}, solver={method})")
+        print(
+            f"[TEST] RMSE Vcorr -> avg: {summary['avg_rmse_vcorr_mV']:.2f} mV, "
+            f"median: {summary['median_rmse_vcorr_mV']:.2f} mV"
+        )
+        if summary["avg_rmse_vtotal_mV"] is not None:
+            print(
+                f"[TEST] RMSE Vtotal -> avg: {summary['avg_rmse_vtotal_mV']:.2f} mV, "
+                f"median: {summary['median_rmse_vtotal_mV']:.2f} mV"
+            )
+
+    if save_path is not None:
+        save_payload = {
+            "results": results,
+            "summary": summary,
+            "training_info": training_info,
+        }
+        torch.save(save_payload, save_path)
+        if verbose:
+            print(f"[TEST] Saved detailed results to: {save_path}")
+
+    return results, summary

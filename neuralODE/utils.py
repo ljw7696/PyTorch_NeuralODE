@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import pandas as pd
-from torchdiffeq import odeint
+from torchdiffeq import odeint_adjoint as odeint
 from scipy.interpolate import interp1d
 from scipy.signal import savgol_filter
 import copy
