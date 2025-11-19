@@ -286,6 +286,8 @@ def df2dict(df_driving_list, df_rest_list=None):
             data_dict['T'] = (df_cur['temperature'].values.astype(np.float32) - temperature_mean) / temperature_norm
             data_dict['V_ref'] = (df_cur['Vref'].values.astype(np.float32) - Vref_mean) / Vref_std
             data_dict['ocv'] = (df_cur['ocp'].values.astype(np.float32) - ocv_mean) / ocv_std
+            data_dict['V_spme_norm'] = (df_cur['Vspme'].values.astype(np.float32) - 3.28) / Vref_std
+
 
             # Outputs
             data_dict['Y'] = (Vcorr - Y_mean) / Y_std
@@ -352,6 +354,8 @@ def df2dict(df_driving_list, df_rest_list=None):
         data_dict['T'] = (df_cur['temperature'].values.astype(np.float32) - temperature_mean) / temperature_norm
         data_dict['V_ref'] = (df_cur['Vref'].values.astype(np.float32) - Vref_mean) / Vref_std
         data_dict['ocv'] = (df_cur['ocp'].values.astype(np.float32) - ocv_mean) / ocv_std
+        data_dict['V_spme_norm'] = (df_cur['Vspme'].values.astype(np.float32) - 3.28) / Vref_std
+
 
         # Outputs
         data_dict['Y'] = (Vcorr - Y_mean) / Y_std
@@ -396,6 +400,7 @@ def df2dict(df_driving_list, df_rest_list=None):
         data_dict['T'] = (df_cur['temperature'].values.astype(np.float32) - temperature_mean) / temperature_norm
         data_dict['V_ref'] = (df_cur['Vref'].values.astype(np.float32) - Vref_mean) / Vref_std
         data_dict['ocv'] = (df_cur['ocp'].values.astype(np.float32) - ocv_mean) / ocv_std
+        data_dict['V_spme_norm'] = (df_cur['Vspme'].values.astype(np.float32) - 3.28) / Vref_std
 
         # Outputs
         data_dict['Y'] = (Vcorr - Y_mean) / Y_std

@@ -29,33 +29,45 @@ class BatteryODEWrapper(nn.Module):
         dxdt    : time derivative of state vector [1x1] = [dVcorr/dt]
     """
     
-    def __init__(self, device='cpu'):
+    def __init__(self, device='cpu', use_V_ref=True, use_V_spme=False, stability_weight=0.0, hidden_dims=None):
         super(BatteryODEWrapper, self).__init__()
         
-        # Neural network: input [V_ref(t), ocv(t), Vcorr(t), SOC(t), I(t), T(t)] -> output dVcorr/dt
-        # 6 inputs: [V_ref_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k]
-        # 7 layers: original working version
-        self.net = nn.Sequential(
-            nn.Linear(6, 32),
-            nn.Tanh(),
-            nn.Linear(32, 32),
-            nn.Tanh(),
-            nn.Linear(32, 32),
-            nn.Tanh(),
-            nn.Linear(32, 16),
-            nn.Tanh(),
-            nn.Linear(16, 1)
-            # nn.Linear(6, 16),
-            # nn.Tanh(),
-            # nn.Linear(16, 1)
-        )
+        # Neural network: input [V_spme_norm(t), ocv(t), Vcorr(t), SOC(t), I(t), T(t)] -> output dVcorr/dt
+        # V_spme_norm is already normalized (provided in dict)
+        # Fixed 6 inputs: V_spme_norm, ocv, Vcorr, SOC, I, T
+        self.use_V_ref = use_V_ref  # Kept for backward compatibility, but not used
+        self.use_V_spme = use_V_spme  # Kept for backward compatibility, but not used
+        self.stability_weight = stability_weight  # For long-term stability regularization
+        
+        # Fixed input dimension: 6 inputs
+        input_dim = 6  # [V_spme_norm, ocv, Vcorr, SOC, I, T]
+        
+        # Default architecture: [32, 32, 32, 16] (smaller capacity)
+        # Can be customized via hidden_dims parameter
+        # Examples:
+        #   hidden_dims=[64, 64, 64, 32]  # Medium capacity
+        #   hidden_dims=[128, 128, 64, 32]  # High capacity
+        #   hidden_dims=[64, 64, 64, 64, 32]  # Deeper network
+        if hidden_dims is None:
+            hidden_dims = [32, 32, 32, 16]  # Default: smaller capacity
+        
+        # Build network dynamically based on hidden_dims
+        layers = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.Tanh())
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, 1))  # Output layer
+        
+        self.net = nn.Sequential(*layers)
         
         # Initialize weights
         for m in self.net.modules():
             if isinstance(m, nn.Linear):
                 # nn.init.xavier_normal_(m.weight, gain=1.0)
                 # nn.init.constant_(m.bias, val=0)
-                nn.init.orthogonal_(m.weight, gain=0.7)  # Orthogonal!
+                nn.init.orthogonal_(m.weight, gain=1)  # Orthogonal!
                 nn.init.constant_(m.bias, 0)
         
         self.device = device
@@ -72,6 +84,10 @@ class BatteryODEWrapper(nn.Module):
         # Initialize step_count for tracking
         self.step_count = 0
         
+        # Normalization parameters (for Vcorr denormalization if needed)
+        self.Y_mean = None
+        self.Y_std = None
+        
         # # Initialize prev_Vcorr for state tracking
         # self.prev_Vcorr = None
         
@@ -81,17 +97,32 @@ class BatteryODEWrapper(nn.Module):
         Similar to MATLAB inputs struct with I(t), T(t), etc.
         
         Args:
-            inputs_dict: {'time': [...], 'V_ref': [...], 'ocv': [...], 'SOC': [...], 'I': [...], 'T': [...], 'V_spme': [...]}
+            inputs_dict: {'time': [...], 'V_spme_norm': [...], 'ocv': [...], 'SOC': [...], 'I': [...], 'T': [...], 
+                        'Y_mean': float, 'Y_std': float}
         """
         time_data = inputs_dict['time']
         
+        # Store normalization parameters (for Vcorr denormalization if needed)
+        if 'Y_mean' in inputs_dict and 'Y_std' in inputs_dict:
+            self.Y_mean = inputs_dict['Y_mean']
+            self.Y_std = inputs_dict['Y_std']
+        else:
+            raise KeyError("Missing 'Y_mean' or 'Y_std' in inputs_dict for Vcorr denormalization")
+        
+        # Check required inputs
+        if 'V_spme_norm' not in inputs_dict:
+            available_keys = list(inputs_dict.keys())
+            raise KeyError(
+                f"Missing required key 'V_spme_norm' in inputs_dict. "
+                f"Available keys: {sorted(available_keys)}"
+            )
+        
         self.inputs_interp = {
-            'V_ref': interp1d(time_data, inputs_dict['V_ref'], kind='linear', fill_value='extrapolate'),
+            'V_spme_norm': interp1d(time_data, inputs_dict['V_spme_norm'], kind='linear', fill_value='extrapolate'),
             'ocv': interp1d(time_data, inputs_dict['ocv'], kind='linear', fill_value='extrapolate'),
             'SOC': interp1d(time_data, inputs_dict['SOC'], kind='linear', fill_value='extrapolate'),
             'I': interp1d(time_data, inputs_dict['I'], kind='linear', fill_value='extrapolate'),
-            'T': interp1d(time_data, inputs_dict['T'], kind='linear', fill_value='extrapolate'), 
-            'V_spme': interp1d(time_data, inputs_dict['V_spme'], kind='linear', fill_value='extrapolate'),
+            'T': interp1d(time_data, inputs_dict['T'], kind='linear', fill_value='extrapolate'),
         }
         
         # # Reset prev_Vcorr when inputs change
@@ -102,7 +133,8 @@ class BatteryODEWrapper(nn.Module):
         Set up pre-interpolated inputs for batch processing
         
         Args:
-            inputs_list: List of dicts, each dict contains {'time', 'V_ref', 'ocv', 'SOC', 'I', 'T', 'V_spme'}
+            inputs_list: List of dicts, each dict contains {'time', 'V_spme_norm', 'ocv', 'SOC', 'I', 'T', 
+                        'Y_mean': float, 'Y_std': float}
                         One dict per profile in the batch
             t_common: Common time vector [0, t_final] for all profiles (numpy array)
         """
@@ -114,41 +146,57 @@ class BatteryODEWrapper(nn.Module):
         self.dt = (t_common[-1] - t_common[0]) / (num_timesteps - 1) if num_timesteps > 1 else 1.0
         
         # Pre-interpolate all inputs for all profiles
-        V_ref_batch = []
         ocv_batch = []
         SOC_batch = []
         I_batch = []
         T_batch = []
-        V_spme_batch = []
+        V_spme_norm_batch = []
         
-        for profile_data in inputs_list:
+        # Store normalization parameters (assume same for all profiles in batch, or use first profile)
+        first_profile = inputs_list[0]
+        if 'Y_mean' in first_profile and 'Y_std' in first_profile:
+            self.Y_mean = first_profile['Y_mean']
+            self.Y_std = first_profile['Y_std']
+        else:
+            raise KeyError("Missing 'Y_mean' or 'Y_std' in inputs_list for Vcorr denormalization")
+        
+        for idx, profile_data in enumerate(inputs_list):
+            # Check required inputs
+            if 'V_spme_norm' not in profile_data:
+                available_keys = list(profile_data.keys())
+                raise KeyError(
+                    f"Profile {idx} missing required key 'V_spme_norm' in inputs_list. "
+                    f"Available keys: {sorted(available_keys)}"
+                )
+            
             # Create interpolation for this profile
             time_orig = profile_data['time']
             
-            V_ref_interp = interp1d(time_orig, profile_data['V_ref'], kind='linear', fill_value='extrapolate')
             ocv_interp = interp1d(time_orig, profile_data['ocv'], kind='linear', fill_value='extrapolate')
             SOC_interp = interp1d(time_orig, profile_data['SOC'], kind='linear', fill_value='extrapolate')
             I_interp = interp1d(time_orig, profile_data['I'], kind='linear', fill_value='extrapolate')
             T_interp = interp1d(time_orig, profile_data['T'], kind='linear', fill_value='extrapolate')
-            V_spme_interp = interp1d(time_orig, profile_data['V_spme'], kind='linear', fill_value='extrapolate')
+            V_spme_norm_interp = interp1d(time_orig, profile_data['V_spme_norm'], kind='linear', fill_value='extrapolate')
             
             # Evaluate at common time points
-            V_ref_batch.append(V_ref_interp(t_common))
             ocv_batch.append(ocv_interp(t_common))
             SOC_batch.append(SOC_interp(t_common))
             I_batch.append(I_interp(t_common))
             T_batch.append(T_interp(t_common))
-            V_spme_batch.append(V_spme_interp(t_common))
+            V_spme_norm_batch.append(V_spme_norm_interp(t_common))
         
         # Convert to GPU tensors: shape (num_timesteps, batch_size)
         self.inputs_batch = {
-            'V_ref': torch.tensor(np.array(V_ref_batch).T, dtype=torch.float32, device=self.device),
+            'V_spme_norm': torch.tensor(np.array(V_spme_norm_batch).T, dtype=torch.float32, device=self.device),
             'ocv': torch.tensor(np.array(ocv_batch).T, dtype=torch.float32, device=self.device),
             'SOC': torch.tensor(np.array(SOC_batch).T, dtype=torch.float32, device=self.device),
             'I': torch.tensor(np.array(I_batch).T, dtype=torch.float32, device=self.device),
             'T': torch.tensor(np.array(T_batch).T, dtype=torch.float32, device=self.device),
-            'V_spme': torch.tensor(np.array(V_spme_batch).T, dtype=torch.float32, device=self.device),
         }
+        
+        # Convert normalization parameters to tensors for GPU computation (for Vcorr denormalization if needed)
+        self.Y_mean_tensor = torch.tensor(self.Y_mean, dtype=torch.float32, device=self.device)
+        self.Y_std_tensor = torch.tensor(self.Y_std, dtype=torch.float32, device=self.device)
         
         print(f"✓ Batch inputs set: {batch_size} profiles, {num_timesteps} time steps")
     
@@ -156,8 +204,9 @@ class BatteryODEWrapper(nn.Module):
         """
         ODE function called by odeint - supports both single and batch modes
         
-        Neural ODE: dVcorr/dt = f(V_ref, ocv, Vcorr, SOC, I, T)
-        where f() is the neural network
+        Neural ODE: dVcorr/dt = f(V_spme_norm, ocv, Vcorr, SOC, I, T)
+        where V_spme_norm is already normalized
+        and f() is the neural network
         
         Args:
             t: current time (scalar)
@@ -186,20 +235,22 @@ class BatteryODEWrapper(nn.Module):
             
             # Get inputs at time t for all profiles - GPU tensor indexing
             if self.batch_indices is not None:
-                V_ref_k = self.inputs_batch['V_ref'][t_idx, self.batch_indices]
+                V_spme_norm_k = self.inputs_batch['V_spme_norm'][t_idx, self.batch_indices]
                 ocv_k = self.inputs_batch['ocv'][t_idx, self.batch_indices]
                 SOC_k = self.inputs_batch['SOC'][t_idx, self.batch_indices]
                 I_k = self.inputs_batch['I'][t_idx, self.batch_indices]
                 T_k = self.inputs_batch['T'][t_idx, self.batch_indices]
             else:
-                V_ref_k = self.inputs_batch['V_ref'][t_idx, :]
+                V_spme_norm_k = self.inputs_batch['V_spme_norm'][t_idx, :]
                 ocv_k = self.inputs_batch['ocv'][t_idx, :]
                 SOC_k = self.inputs_batch['SOC'][t_idx, :]
                 I_k = self.inputs_batch['I'][t_idx, :]
                 T_k = self.inputs_batch['T'][t_idx, :]
             
-            # Neural Network Input: X = [V_ref(k), ocv(k), Vcorr(k), SOC(k), I(k), T(k)] for all profiles
-            nn_input = torch.stack([V_ref_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k], dim=1)  # (batch_size, 6)
+            # Neural Network Input: Fixed 6 inputs [V_spme_norm(k), ocv(k), Vcorr(k), SOC(k), I(k), T(k)]
+            # V_spme_norm is already normalized
+            # Fixed input order: [V_spme_norm, ocv, Vcorr, SOC, I, T]
+            nn_input = torch.stack([V_spme_norm_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k], dim=1)  # (batch_size, 6)
             
             # Neural Network Output: dVcorr/dt(k)
             dVcorr_dt_k = self.net(nn_input)
@@ -214,16 +265,20 @@ class BatteryODEWrapper(nn.Module):
             # Evaluate time-varying inputs at time t
             if self.inputs_interp is None:
                 raise ValueError("Must call set_inputs() before solving ODE")
+            
+            if self.Y_mean is None or self.Y_std is None:
+                raise ValueError("Normalization parameters not set. Call set_inputs() with Y_mean, Y_std")
                 
-            V_ref_k = float(self.inputs_interp['V_ref'](t_val))    # Vref(k)
+            V_spme_norm_k = float(self.inputs_interp['V_spme_norm'](t_val))  # V_spme_norm(k) - already normalized
             ocv_k = float(self.inputs_interp['ocv'](t_val))        # ocv(k)
             SOC_k = float(self.inputs_interp['SOC'](t_val))         # SOC(k)
             I_k = float(self.inputs_interp['I'](t_val))            # I(k)
             T_k = float(self.inputs_interp['T'](t_val))              # T(k)
-            Vspme_k = float(self.inputs_interp['V_spme'](t_val))   # Vspme(k)
             
-            # Neural Network Input: X = [Vref(k), ocv(k), Vcorr(k), SOC(k), I(k), T(k)]
-            nn_input = torch.tensor([[V_ref_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k]], dtype=torch.float32, device=self.device)
+            # Neural Network Input: Fixed 6 inputs [V_spme_norm(k), ocv(k), Vcorr(k), SOC(k), I(k), T(k)]
+            # V_spme_norm is already normalized
+            # Fixed input order: [V_spme_norm, ocv, Vcorr, SOC, I, T]
+            nn_input = torch.tensor([[V_spme_norm_k, ocv_k, Vcorr_k, SOC_k, I_k, T_k]], dtype=torch.float32, device=self.device)
             
             # Neural Network Output: dVcorr/dt(k)
             dVcorr_dt_k = self.net(nn_input)
@@ -236,16 +291,25 @@ class BatteryODEWrapper(nn.Module):
 
 
 
-def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', verbose=True, pretrained_model_path=None):
+def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', verbose=True, pretrained_model_path=None, use_V_ref=True, use_V_spme=False, stability_weight=0.0, hidden_dims=None):
     """
     Train battery Neural ODE - mirrors MATLAB ode15s usage
     
     Args:
-        data_dict: {'time', 'V_ref', 'ocv', 'SOC', 'I', 'T', 'V_spme', 'V_meas'}
+        data_dict: {'time', 'V_ref', 'ocv', 'SOC', 'I', 'T', 'Y', 'Y_std'}
+                  - V_ref: Reference voltage (already normalized)
+                  - Y: Target Vcorr (normalized)
+                  - Y_std: Standard deviation for denormalization
         num_epochs: number of training epochs
         lr: learning rate  
         device: device to use
-        verbose: print prsogress
+        verbose: print progress
+        pretrained_model_path: path to pretrained model
+        use_V_ref: Kept for backward compatibility (not used in current implementation)
+        use_V_spme: Kept for backward compatibility (not used in current implementation)
+        stability_weight: Weight for stability regularization (0.0 = disabled). 
+                         Use > 0 to prevent long-term divergence.
+                         Recommended: 0.01-0.1 for stability without sacrificing accuracy.
         
     Returns:
         ode_wrapper: trained ODE wrapper
@@ -265,7 +329,7 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
     Ystd = data_dict['Y_std']
 
     # Create ODE wrapper (replaces ode_wrapper_poly)
-    ode_wrapper = BatteryODEWrapper(device)
+    ode_wrapper = BatteryODEWrapper(device, use_V_ref=use_V_ref, use_V_spme=use_V_spme, stability_weight=stability_weight, hidden_dims=hidden_dims)
     ode_wrapper = ode_wrapper.to(device) # Move to GPU
 
     # Load pretrained model if provided
@@ -320,8 +384,8 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
         factor=0.5,
         patience=10,
         min_lr=1e-10,
-        threshold=1e-3,      # 1% 개선
-        threshold_mode='rel'
+        threshold=0.005,      # 0.005 mV (0.5mV) - original setting
+        threshold_mode='abs'
         )
 
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -373,6 +437,11 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
     print(f"alpha: {alpha:.2f}")
     print(f"beta: {beta:.2f}")
     print(f"gamma: {gamma:.2f}")
+    print(f"Input configuration: Fixed 6 inputs [V_spme_norm, ocv, Vcorr, SOC, I, T]")
+    print(f"  - V_spme_norm: Normalized SPME physics model prediction (replaces V_ref)")
+    print(f"use_V_ref: {use_V_ref} (kept for compatibility, not used)")
+    print(f"use_V_spme: {use_V_spme} (kept for compatibility, not used)")
+    print(f"stability_weight: {stability_weight} (0 = disabled, >0 = prevent divergence)")
     print(f"GPU: {gpu_mem}")
     print(f"grad_clip_max: {grad_clip_max}")
     print(f"verbose: {verbose}")
@@ -404,8 +473,17 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
         loss_V = torch.mean((Vcorr_pred - Vcorr_target) ** 2) # 전압의 차이를 최소화
         loss_tv = torch.mean(torch.abs(torch.diff(Vcorr_pred))) # 전압의 변화량을 최소화
         mae_V = torch.mean(torch.abs(Vcorr_pred - Vcorr_target))
+        
+        # Long-term stability regularization (prevent divergence)
+        # Penalize large deviations from target trajectory
+        if ode_wrapper.stability_weight > 0:
+            # Penalize cumulative error growth
+            error_cumulative = torch.cumsum(torch.abs(Vcorr_pred - Vcorr_target), dim=0)
+            loss_stability = torch.mean(error_cumulative[-len(error_cumulative)//10:])  # Focus on later time points
+        else:
+            loss_stability = torch.tensor(0.0, device=device)
 
-        loss = alpha * loss_V + beta * loss_dVdt + gamma * loss_tv
+        loss = alpha * loss_V + beta * loss_dVdt + gamma * loss_tv + ode_wrapper.stability_weight * loss_stability
 
         
         # Backprop
@@ -433,7 +511,7 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
 
         # Update learning rate
         if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-            scheduler.step(loss_V)  # ReduceLROnPlateau requires metric
+            scheduler.step(rmse * Ystd * 1000)  # step with mV metric
         else:
             scheduler.step()  # Other schedulers (CosineAnnealingWarmRestarts, ExponentialLR, etc.)
         new_lr = optimizer.param_groups[0]['lr']
@@ -982,7 +1060,7 @@ def compute_grad_norm(model):
     return total_norm ** 0.5
 
 
-def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='cpu', verbose=True, training_batch_size=None, ode_wrapper=None, method='euler'):
+def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='cpu', verbose=True, training_batch_size=None, ode_wrapper=None, method='euler', use_V_ref=True, use_V_spme=False, max_profile_length=None, curriculum_learning=False, hidden_dims=None):
     """
     Train battery Neural ODE on multiple profiles (batch version)
     
@@ -995,6 +1073,19 @@ def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='c
         verbose: print progress
         training_batch_size: Number of profiles to use per training step (None = use all)
         ode_wrapper: Optional pre-existing BatteryODEWrapper instance to continue training from
+        method: ODE solver method ('euler', 'rk4', etc.)
+        use_V_ref: If True, use V_ref (Vmeas) as input. If False, learn pure dynamics without V_ref.
+                   Note: Using V_ref may cause the model to learn Vmeas mapping rather than dynamics.
+        max_profile_length: Maximum profile length to use (None = use full length)
+                           If specified, profiles will be truncated to this length
+        curriculum_learning: If True, start with shorter profiles (20% of original) and gradually increase
+                            Requires max_profile_length=None
+        hidden_dims: List of hidden layer dimensions (e.g., [64, 64, 64, 32] for medium capacity)
+                    None = use default [32, 32, 32, 16]
+                    Examples:
+                      [64, 64, 64, 32]  # Medium capacity
+                      [128, 128, 64, 32]  # High capacity
+                      [64, 64, 64, 64, 32]  # Deeper network
         
     Returns:
         ode_wrapper: trained ODE wrapper
@@ -1020,9 +1111,33 @@ def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='c
         data_norm['time'] = t_orig - t_orig[0]
         normalized_data_list.append(data_norm)
     
-    # Find common time range and length after normalization
+    # Find original time range and length after normalization
     time_lengths = [len(data['time']) for data in normalized_data_list]
     time_durations = [data['time'][-1] for data in normalized_data_list]
+    
+    original_max_length = max(time_lengths)
+    original_max_duration = max(time_durations)
+    
+    # Curriculum Learning: Start with shorter profiles and gradually increase
+    if curriculum_learning and max_profile_length is None:
+        # Start with 20% of original length
+        initial_length = max(10, int(original_max_length * 0.2))
+        max_profile_length = initial_length
+        print(f"📚 Curriculum Learning: Starting with {max_profile_length} points ({original_max_length * 0.2:.1f}% of original)")
+    
+    # Limit profile length if specified
+    if max_profile_length is not None:
+        print(f"✂️  Limiting profile length to {max_profile_length} points")
+        for data in normalized_data_list:
+            if len(data['time']) > max_profile_length:
+                # Truncate all arrays to max_profile_length
+                for key in data.keys():
+                    if isinstance(data[key], np.ndarray) and len(data[key]) > max_profile_length:
+                        data[key] = data[key][:max_profile_length]
+        
+        # Recalculate after truncation
+        time_lengths = [len(data['time']) for data in normalized_data_list]
+        time_durations = [data['time'][-1] for data in normalized_data_list]
     
     print(f"Profile lengths: {time_lengths}")
     print(f"Time durations: {[f'{d:.1f}s' for d in time_durations]}")
@@ -1039,22 +1154,33 @@ def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='c
     targets_list = []
     Y_std_list = []
     
-    for data in normalized_data_list:
+    for idx, data in enumerate(normalized_data_list):
+        # Check required keys
+        required_keys = ['V_spme_norm', 'Y_mean', 'Y_std']
+        missing_keys = [key for key in required_keys if key not in data]
+        if missing_keys:
+            available_keys = list(data.keys())
+            raise KeyError(
+                f"Data item {idx} missing required keys: {missing_keys}. "
+                f"Available keys: {sorted(available_keys)}"
+            )
+        
         inputs_list.append({
             'time': data['time'],
-            'V_ref': data['V_ref'],
+            'V_spme_norm': data['V_spme_norm'],  # V_spme_norm (already normalized)
             'ocv': data['ocv'],
             'SOC': data['SOC'],
             'I': data['I'],
             'T': data['T'],
-            'V_spme': data['V_spme'],
+            'Y_mean': data['Y_mean'],  # For Vcorr denormalization (if needed)
+            'Y_std': data['Y_std'],    # For Vcorr denormalization (if needed)
         })
         targets_list.append(data['Y'])
         Y_std_list.append(data['Y_std'])
     
     # Create ODE wrapper or use provided one
     if ode_wrapper is None:
-        ode_wrapper = BatteryODEWrapper(device)
+        ode_wrapper = BatteryODEWrapper(device, use_V_ref=use_V_ref, use_V_spme=use_V_spme, hidden_dims=hidden_dims)
         ode_wrapper = ode_wrapper.to(device)
     else:
         # Use provided wrapper and ensure it's on the correct device
@@ -1084,10 +1210,12 @@ def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='c
         valid_mask[i, :valid_len] = True
     
     # Print Network Architecture
+    param_count = sum(p.numel() for p in ode_wrapper.parameters())
     print("\n" + "="*60)
     print("Neural Network Architecture")
     print("="*60)
     print(ode_wrapper.net)
+    print(f"\nTotal parameters: {param_count:,}")
     print("="*60 + "\n")
     
     # Optimizer
@@ -1100,8 +1228,8 @@ def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='c
         factor=0.5,
         patience=10,
         min_lr=1e-10,
-        threshold=1e-3,
-        threshold_mode='rel'
+        threshold=0.005,   # 0.005 mV
+        threshold_mode='abs'
     )
     
     history = {
@@ -1143,6 +1271,11 @@ def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='c
     print(f"Device: {device}")
     print(f"Patience: {scheduler.patience}")
     print(f"Alpha: {alpha:.2f}, Beta: {beta:.2f}, Gamma: {gamma:.2f}")
+    print(f"Input configuration: Fixed 6 inputs [V_spme_norm, ocv, Vcorr, SOC, I, T]")
+    print(f"  - V_spme_norm: Normalized SPME physics model prediction (already normalized)")
+    print(f"Model architecture: {hidden_dims if hidden_dims else [32, 32, 32, 16]} (hidden_dims)")
+    print(f"use_V_ref: {use_V_ref} (kept for compatibility, not used)")
+    print(f"use_V_spme: {use_V_spme} (kept for compatibility, not used)")
     print(f"GPU: {gpu_mem}")
     print(f"Grad clip max: {grad_clip_max}")
     print(f"Method: {method}")
@@ -1256,8 +1389,8 @@ def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='c
             best_model_state = copy.deepcopy(ode_wrapper.state_dict())
             print(f"✅ Best RMSE: {best_rmse * Y_std_avg * 1000:.2f}mV at Epoch {best_epoch+1}")
         
-        # Update learning rate
-        scheduler.step(loss_V)
+        # Update learning rate (use mV metric)
+        scheduler.step(rmse * Y_std_avg * 1000)
         new_lr = optimizer.param_groups[0]['lr']
         
         # Print every epoch
@@ -1416,15 +1549,26 @@ def test_battery_neural_ode_batch(
         y_mean_list = []
         y_std_list = []
 
-        for prof in batch_profiles:
+        for idx, prof in enumerate(batch_profiles):
+            # Check required keys
+            required_keys = ['V_spme_norm', 'Y_mean', 'Y_std']
+            missing_keys = [key for key in required_keys if key not in prof]
+            if missing_keys:
+                available_keys = list(prof.keys())
+                raise KeyError(
+                    f"Profile {idx} missing required keys: {missing_keys} in batch_profiles. "
+                    f"Available keys: {sorted(available_keys)}"
+                )
+            
             inputs_list.append({
                 "time": prof["time"],
-                "V_ref": prof["V_ref"],
+                "V_spme_norm": prof["V_spme_norm"],  # V_spme_norm (already normalized)
                 "ocv": prof["ocv"],
                 "SOC": prof["SOC"],
                 "I": prof["I"],
                 "T": prof["T"],
-                "V_spme": prof["V_spme"],
+                "Y_mean": prof["Y_mean"],  # For Vcorr denormalization (if needed)
+                "Y_std": prof["Y_std"],    # For Vcorr denormalization (if needed)
             })
             targets_list.append(prof["Y"])
             v_spme_list.append(prof.get("V_spme"))
@@ -1555,3 +1699,250 @@ def test_battery_neural_ode_batch(
             print(f"[TEST] Saved detailed results to: {save_path}")
 
     return results, summary
+
+
+def test_long_term_stability(ode_wrapper, data_dict, prediction_multiplier=2.0, device='cuda', verbose=True):
+    """
+    Test long-term prediction stability (divergence check)
+    
+    Args:
+        ode_wrapper: trained model
+        data_dict: test data
+        prediction_multiplier: Extend prediction time by this factor (e.g., 2.0 = 2x longer)
+        device: device to use
+        verbose: print results
+        
+    Returns:
+        results: dict with stability metrics
+    """
+    ode_wrapper.eval()
+    ode_wrapper.set_inputs(data_dict)
+    
+    # Original time range
+    t_orig = np.array(data_dict['time'])
+    t_max_orig = t_orig[-1]
+    t_extended = np.linspace(t_orig[0], t_orig[0] + (t_max_orig - t_orig[0]) * prediction_multiplier, 
+                            int(len(t_orig) * prediction_multiplier))
+    
+    # Extend inputs by extrapolation
+    extended_data = data_dict.copy()
+    extended_data['time'] = t_extended
+    
+    # Extend other inputs by extrapolation (constant or linear)
+    for key in ['V_ref', 'ocv', 'SOC', 'I', 'T', 'V_spme']:
+        if key in data_dict:
+            # Simple extrapolation: use last value
+            last_val = data_dict[key][-1]
+            extended = np.concatenate([data_dict[key], np.full(len(t_extended) - len(t_orig), last_val)])
+            extended_data[key] = extended
+    
+    ode_wrapper.set_inputs(extended_data)
+    
+    # Run prediction
+    t_eval = torch.tensor(t_extended, dtype=torch.float32, device=device)
+    x0 = torch.tensor([[data_dict['Y'][0]]], dtype=torch.float32, device=device)
+    
+    with torch.no_grad():
+        solution = odeint(ode_wrapper, x0, t_eval, method='euler')
+        Vcorr_pred_extended = solution[:, 0, 0].cpu().numpy()
+    
+    # Denormalize
+    if 'Y_mean' in data_dict and 'Y_std' in data_dict:
+        Y_mean = data_dict['Y_mean']
+        Y_std = data_dict['Y_std']
+        Vcorr_pred_extended = Vcorr_pred_extended * Y_std + Y_mean
+    
+    # Calculate metrics
+    # Original range
+    Vcorr_pred_orig = Vcorr_pred_extended[:len(t_orig)]
+    Vcorr_target = np.array(data_dict['Y'])
+    if 'Y_mean' in data_dict and 'Y_std' in data_dict:
+        Vcorr_target = Vcorr_target * Y_std + Y_mean
+    
+    # Extended range (beyond training)
+    Vcorr_pred_ext = Vcorr_pred_extended[len(t_orig):]
+    
+    # Metrics
+    rmse_orig = np.sqrt(np.mean((Vcorr_pred_orig - Vcorr_target)**2)) * 1000  # mV
+    
+    # Check for divergence in extended range
+    if len(Vcorr_pred_ext) > 0:
+        # Check if prediction grows unbounded
+        max_deviation = np.max(np.abs(Vcorr_pred_ext - Vcorr_pred_ext[0]))
+        std_deviation = np.std(Vcorr_pred_ext)
+        mean_deviation = np.mean(np.abs(Vcorr_pred_ext - Vcorr_pred_ext[0]))
+        
+        # Divergence indicator: large and growing error
+        is_diverging = (max_deviation > 0.1) or (std_deviation > 0.05)  # Thresholds in V
+    else:
+        max_deviation = 0
+        std_deviation = 0
+        mean_deviation = 0
+        is_diverging = False
+    
+    results = {
+        'rmse_original_range_mV': rmse_orig,
+        'max_deviation_extended_V': max_deviation,
+        'std_deviation_extended_V': std_deviation,
+        'mean_deviation_extended_V': mean_deviation,
+        'is_diverging': is_diverging,
+        'prediction_multiplier': prediction_multiplier,
+        'Vcorr_pred_extended': Vcorr_pred_extended,
+        't_extended': t_extended,
+    }
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("Long-term Stability Test")
+        print("="*60)
+        print(f"Original range RMSE: {rmse_orig:.2f} mV")
+        print(f"Extended prediction ({prediction_multiplier}x longer):")
+        print(f"  Max deviation: {max_deviation*1000:.2f} mV")
+        print(f"  Std deviation: {std_deviation*1000:.2f} mV")
+        print(f"  Mean deviation: {mean_deviation*1000:.2f} mV")
+        
+        if is_diverging:
+            print(f"\n❌ WARNING: Model shows DIVERGENCE in long-term prediction!")
+            print(f"   → Consider using V_ref or increasing stability_weight")
+        else:
+            print(f"\n✅ Model is STABLE in long-term prediction")
+        print("="*60 + "\n")
+    
+    return results
+
+
+def compare_with_without_V_ref(data_dict, num_epochs=50, lr=1e-3, device='cuda', verbose=True, test_long_term=True):
+    """
+    V_ref 사용 여부에 따른 성능 비교 실험
+    
+    Args:
+        data_dict: training data
+        num_epochs: number of epochs for each experiment
+        lr: learning rate
+        device: device to use
+        verbose: print progress
+        
+    Returns:
+        results: dict with 'with_V_ref' and 'without_V_ref' results
+    """
+    print("\n" + "="*60)
+    print("Comparing models: with V_ref vs without V_ref")
+    print("="*60)
+    
+    results = {}
+    
+    # Train with V_ref
+    print("\n[1/2] Training WITH V_ref...")
+    print("-" * 60)
+    ode_wrapper_with, history_with = train_battery_neural_ode(
+        data_dict, 
+        num_epochs=num_epochs, 
+        lr=lr, 
+        device=device, 
+        verbose=verbose,
+        use_V_ref=True
+    )
+    
+    # Evaluate with V_ref
+    Vcorr_pred_with, Vcorr_target, Vtotal_pred_with, Vtotal_meas, t_eval = simulate_battery_ode(
+        ode_wrapper_with, data_dict, device=device, plot=False
+    )
+    
+    rmse_vcorr_with = np.sqrt(np.mean((Vcorr_pred_with - Vcorr_target)**2)) * 1000  # mV
+    rmse_vtotal_with = np.sqrt(np.mean((Vtotal_pred_with - Vtotal_meas)**2)) * 1000 if Vtotal_meas is not None else None
+    
+    results['with_V_ref'] = {
+        'rmse_vcorr_mV': rmse_vcorr_with,
+        'rmse_vtotal_mV': rmse_vtotal_with,
+        'history': history_with,
+        'model': ode_wrapper_with
+    }
+    
+    # Train without V_ref
+    print("\n[2/2] Training WITHOUT V_ref (pure dynamics)...")
+    print("-" * 60)
+    ode_wrapper_without, history_without = train_battery_neural_ode(
+        data_dict, 
+        num_epochs=num_epochs, 
+        lr=lr, 
+        device=device, 
+        verbose=verbose,
+        use_V_ref=False
+    )
+    
+    # Evaluate without V_ref
+    Vcorr_pred_without, Vcorr_target, Vtotal_pred_without, Vtotal_meas, t_eval = simulate_battery_ode(
+        ode_wrapper_without, data_dict, device=device, plot=False
+    )
+    
+    rmse_vcorr_without = np.sqrt(np.mean((Vcorr_pred_without - Vcorr_target)**2)) * 1000  # mV
+    rmse_vtotal_without = np.sqrt(np.mean((Vtotal_pred_without - Vtotal_meas)**2)) * 1000 if Vtotal_meas is not None else None
+    
+    results['without_V_ref'] = {
+        'rmse_vcorr_mV': rmse_vcorr_without,
+        'rmse_vtotal_mV': rmse_vtotal_without,
+        'history': history_without,
+        'model': ode_wrapper_without
+    }
+    
+    # Test long-term stability if requested
+    if test_long_term:
+        print("\n" + "="*60)
+        print("Testing Long-term Stability (Divergence Check)")
+        print("="*60)
+        
+        print("\n[1/2] Testing WITH V_ref...")
+        stability_with = test_long_term_stability(ode_wrapper_with, data_dict, prediction_multiplier=2.0, device=device, verbose=False)
+        
+        print("\n[2/2] Testing WITHOUT V_ref...")
+        stability_without = test_long_term_stability(ode_wrapper_without, data_dict, prediction_multiplier=2.0, device=device, verbose=False)
+        
+        results['with_V_ref']['stability'] = stability_with
+        results['without_V_ref']['stability'] = stability_without
+        
+        print("\nLong-term Stability Comparison:")
+        print(f"  With V_ref:    {'✅ STABLE' if not stability_with['is_diverging'] else '❌ DIVERGING'}")
+        print(f"  Without V_ref: {'✅ STABLE' if not stability_without['is_diverging'] else '❌ DIVERGING'}")
+        
+        if stability_without['is_diverging'] and not stability_with['is_diverging']:
+            print(f"\n⚠️  CRITICAL: Without V_ref, model diverges in long-term prediction!")
+            print(f"   → Strongly recommend using V_ref or stability_weight > 0")
+    
+    # Print comparison
+    print("\n" + "="*60)
+    print("COMPARISON RESULTS")
+    print("="*60)
+    print(f"With V_ref:")
+    print(f"  Vcorr RMSE: {rmse_vcorr_with:.2f} mV")
+    if rmse_vtotal_with is not None:
+        print(f"  Vtotal RMSE: {rmse_vtotal_with:.2f} mV")
+    
+    print(f"\nWithout V_ref (pure dynamics):")
+    print(f"  Vcorr RMSE: {rmse_vcorr_without:.2f} mV")
+    if rmse_vtotal_without is not None:
+        print(f"  Vtotal RMSE: {rmse_vtotal_without:.2f} mV")
+    
+    # Calculate difference
+    diff_vcorr = rmse_vcorr_without - rmse_vcorr_with
+    diff_pct = (diff_vcorr / rmse_vcorr_with) * 100 if rmse_vcorr_with > 0 else 0
+    
+    print(f"\nDifference:")
+    print(f"  Vcorr RMSE: {diff_vcorr:+.2f} mV ({diff_pct:+.1f}%)")
+    if rmse_vtotal_with is not None and rmse_vtotal_without is not None:
+        diff_vtotal = rmse_vtotal_without - rmse_vtotal_with
+        diff_pct_vtotal = (diff_vtotal / rmse_vtotal_with) * 100 if rmse_vtotal_with > 0 else 0
+        print(f"  Vtotal RMSE: {diff_vtotal:+.2f} mV ({diff_pct_vtotal:+.1f}%)")
+    
+    if abs(diff_pct) < 5:
+        print(f"\n✅ Conclusion: V_ref removal has MINIMAL impact (<5% difference)")
+        print(f"   → Pure dynamics learning is sufficient!")
+    elif abs(diff_pct) < 20:
+        print(f"\n⚠️  Conclusion: V_ref removal has MODERATE impact ({abs(diff_pct):.1f}% difference)")
+        print(f"   → Consider keeping V_ref for better accuracy, or use more training")
+    else:
+        print(f"\n❌ Conclusion: V_ref removal has SIGNIFICANT impact ({abs(diff_pct):.1f}% difference)")
+        print(f"   → V_ref is important for this dataset. Consider keeping it.")
+    
+    print("="*60 + "\n")
+    
+    return results
