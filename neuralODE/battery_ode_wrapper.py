@@ -23,7 +23,7 @@ class BatteryODEWrapper(nn.Module):
     Inputs:
         t       : current time [s] 
         x       : state vector [1x1] = [Vcorr]
-        inputs  : dict with time-varying inputs (V_ref(t), ocv(t), SOC(t), I(t), T(t))
+        inputs  : dict with time-varying inputs (V_spme_norm(t), ocv(t), SOC(t), I(t), T(t))
         params  : neural network parameters (self.net)
     Output:
         dxdt    : time derivative of state vector [1x1] = [dVcorr/dt]
@@ -67,7 +67,7 @@ class BatteryODEWrapper(nn.Module):
             if isinstance(m, nn.Linear):
                 # nn.init.xavier_normal_(m.weight, gain=1.0)
                 # nn.init.constant_(m.bias, val=0)
-                nn.init.orthogonal_(m.weight, gain=1)  # Orthogonal!
+                nn.init.orthogonal_(m.weight, gain=0.5)  # Orthogonal!
                 nn.init.constant_(m.bias, 0)
         
         self.device = device
@@ -437,8 +437,8 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
     print(f"alpha: {alpha:.2f}")
     print(f"beta: {beta:.2f}")
     print(f"gamma: {gamma:.2f}")
-    print(f"Input configuration: Fixed 6 inputs [V_spme_norm, ocv, Vcorr, SOC, I, T]")
-    print(f"  - V_spme_norm: Normalized SPME physics model prediction (replaces V_ref)")
+    print(f"Input configuration: Fixed 6 inputs [V_ref, ocv, Vcorr, SOC, I, T]")
+    print(f"  - V_ref: Normalized reference voltage (measured voltage)")
     print(f"use_V_ref: {use_V_ref} (kept for compatibility, not used)")
     print(f"use_V_spme: {use_V_spme} (kept for compatibility, not used)")
     print(f"stability_weight: {stability_weight} (0 = disabled, >0 = prevent divergence)")
@@ -591,6 +591,7 @@ def train_battery_neural_ode(data_dict, num_epochs=100, lr=1e-3, device='cpu', v
                 'device': device,
                 'Y_std': Ystd,
                 'Y_mean': data_dict.get('Y_mean', None),
+                'hidden_dims': hidden_dims,  # Save architecture info
             },
             'network_architecture': str(ode_wrapper.net)
         }
@@ -1445,6 +1446,7 @@ def train_battery_neural_ode_batch(data_list, num_epochs=100, lr=1e-3, device='c
                 'method': method,
                 'total_training_time_seconds': total_training_time,
                 'total_training_time_formatted': time_str,
+                'hidden_dims': hidden_dims,  # Save architecture info
             },
         }
         torch.save(checkpoint, best_model_path)
@@ -1488,8 +1490,17 @@ def test_battery_neural_ode_batch(
     state_dict = checkpoint["model_state_dict"]
     training_info = checkpoint.get("training_info", {})
 
+    # Get hidden_dims from checkpoint
+    hidden_dims = training_info.get("hidden_dims", None)
+    if hidden_dims is None:
+        raise ValueError(
+            f"Checkpoint missing 'hidden_dims' in training_info. "
+            f"Available keys: {sorted(training_info.keys())}"
+        )
+
     if verbose:
         print(f"\n[TEST] Loading checkpoint: {checkpoint_path}")
+        print(f"  Architecture: hidden_dims={hidden_dims}")
         if training_info:
             print("  --- Checkpoint Training Info ---")
             for key in sorted(training_info.keys()):
@@ -1501,8 +1512,8 @@ def test_battery_neural_ode_batch(
             print(checkpoint["network_architecture"])
         print("=" * 60)
 
-    # Create wrapper and load weights
-    ode_wrapper = BatteryODEWrapper(device=device).to(device)
+    # Create wrapper with same architecture as checkpoint
+    ode_wrapper = BatteryODEWrapper(device=device, hidden_dims=hidden_dims).to(device)
     ode_wrapper.load_state_dict(state_dict)
     ode_wrapper.eval()
 

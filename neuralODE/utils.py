@@ -228,14 +228,12 @@ def smooth_Vcorr(df_list, window_size=21):
         print(f"- df{idx+1}: {original_length} -> {final_length} (smoothing done)")
         
         result_list.append(df_result)
-        
+    
     
     print("smooth_Vcorr() completed")
     print("="*50)
     
     return result_list
-
-
 
 
 def df2dict(df_driving_list, df_rest_list=None):
@@ -299,7 +297,9 @@ def df2dict(df_driving_list, df_rest_list=None):
             # data_dict['csn_bulk'] = df_cur['c_s_n_bulk'].values.astype(np.float32) / csn_bulk_norm  # Keep for reference
             data_dict['V_meas'] = df_cur['Vref'].values.astype(np.float32)
             data_dict['V_spme'] = df_cur['Vspme'].values.astype(np.float32)
+            data_dict['Vcorr'] = Vcorr
             dict_list_driving.append(data_dict)
+
 
             # Normalization Information
             data_dict['csn_bulk_norm'] = csn_bulk_norm
@@ -603,17 +603,15 @@ def zero_order_hold_dict_list(dict_list, hold_factor, keys_to_hold=None):
     return held_list
 
 
-
-
 def compute_grad_norm(model):
+    """Compute gradient norm of model parameters"""
     total_norm = 0.0
     for p in model.parameters():
         if p.grad is not None:
             param_norm = p.grad.data.norm(2)
             total_norm += param_norm.item() ** 2
-    return total_norm ** 0.5
-
-
+    total_norm = total_norm ** (1. / 2)
+    return total_norm
 
 
 def remove_duplicates(df_list, verbose=True):
@@ -690,8 +688,6 @@ def remove_duplicates(df_list, verbose=True):
     return cleaned_list
 
 
-
-
 def split_df(list_of_df, window_minutes=30, time_col='time', random_seed=None):
     """
     각 DataFrame에서 순차적으로 30분(1800초) 구간씩 겹치지 않게 쪼개서 반환.
@@ -730,11 +726,19 @@ def split_df(list_of_df, window_minutes=30, time_col='time', random_seed=None):
 
     window_seconds = window_minutes * 60
     return_list = []
-
+    
     for df in list_of_df:
         times = df[time_col].values
-        st = 0  # 시작 인덱스
         df_len = len(df)
+        
+        # window가 데이터 길이보다 크면 입력 그대로 리턴
+        if df_len > 0:
+            total_time_span = times[-1] - times[0]
+            if window_seconds > total_time_span:
+                return_list.append(df.copy())
+            continue
+        
+        st = 0  # 시작 인덱스
 
         # 시간 직접 체크 (순차적 방식)
         while st < df_len:
@@ -750,15 +754,13 @@ def split_df(list_of_df, window_minutes=30, time_col='time', random_seed=None):
             valid_indices = np.where(valid_mask)[0]
             
             if len(valid_indices) == 0:
-                break  # 쪼갤 수 없음
+                # 마지막 조각 추가 (window보다 작은 남은 데이터)
+                if st < df_len:
+                    return_list.append(df.iloc[st:].reset_index(drop=True))
+                break
             
             # valid_indices는 times[st:]의 상대 인덱스이므로, 원래 인덱스로 변환
             end_idx = st + valid_indices[-1]
-
-            # 너무 작은 window는 버림 (예: window의 80% 미만)
-            actual_window_time = times[end_idx] - curr_time
-            if actual_window_time < window_seconds * 0.8:
-                break
 
             return_list.append(df.iloc[st:end_idx+1].reset_index(drop=True))
 
@@ -840,7 +842,6 @@ def split_train_val_test(dict_list, train_ratio=0.6, val_ratio=0.2, test_ratio=0
     return training_dict_list, validation_dict_list, test_dict_list
 
 
-
 def match_exact_keywords(key, keywords):
     """
     key가 예: 'udds2_1c_rest_25C_struct' 같이 _로 나눠진 경우,
@@ -850,7 +851,6 @@ def match_exact_keywords(key, keywords):
     tokens = re.split(r'[_\s]', key)
     # 모든 keywords가 이 토큰 list에 "정확히 단어로써" 존재하는가?
     return any(word in tokens for word in keywords)
-
 
 
 def extract_data(df_list, target_keyword, soc_lb=0.11, soc_ub=0.96):
@@ -880,3 +880,854 @@ def extract_data(df_list, target_keyword, soc_lb=0.11, soc_ub=0.96):
         print("⚠️ 조건에 맞는 DataFrame이 없습니다. (key 토큰, 컬럼, 타입, 마스킹 등 모두 점검)")
 
     return ret_list
+
+
+def extract_upper_envelope(data, window_size=7, percentile=97, column=None, 
+                          smooth_window=None, smooth_method='moving_average'):
+    """
+    Extract upper envelope from time series data using sliding window percentile.
+    Optionally apply additional smoothing to remove remaining pulses.
+    
+    Args:
+        data: 1D numpy array, list, or pandas DataFrame
+              If DataFrame, specify column name to extract
+        window_size: int, size of sliding window for percentile calculation
+        percentile: float, percentile value (0-100) for upper envelope
+        column: str, column name if data is DataFrame (default: 'Vcorr')
+        smooth_window: int or None, window size for additional smoothing (None = no smoothing)
+        smooth_method: str, smoothing method ('moving_average', 'savgol', or 'butterworth')
+    
+    Returns:
+        envelope: 1D numpy array, upper envelope of the input data
+    
+    Example:
+        >>> # 방법 1: 배열 직접 사용
+        >>> import numpy as np
+        >>> data = np.array([1, 2, 5, 3, 4, 6, 2, 3])
+        >>> envelope = extract_upper_envelope(data, window_size=3, percentile=90)
+        >>> 
+        >>> # 방법 2: DataFrame에서 Vcorr 컬럼 추출
+        >>> envelope = extract_upper_envelope(df, window_size=15, percentile=95, column='Vcorr')
+        >>> 
+        >>> # 방법 3: 추가 smoothing 적용 (펄스 제거)
+        >>> envelope = extract_upper_envelope(df, 
+        ...                                   window_size=15, 
+        ...                                   percentile=95,
+        ...                                   column='Vcorr',
+        ...                                   smooth_window=21, 
+        ...                                   smooth_method='savgol')
+        >>> 
+        >>> # 방법 4: moving average smoothing
+        >>> envelope = extract_upper_envelope(df,
+        ...                                   window_size=25,
+        ...                                   percentile=98,
+        ...                                   smooth_window=31,
+        ...                                   smooth_method='moving_average')
+    """
+    # Handle DataFrame input
+    if isinstance(data, pd.DataFrame):
+        if column is None:
+            column = 'Vcorr'  # default column
+        if column not in data.columns:
+            raise ValueError(f"Column '{column}' not found in DataFrame. Available columns: {list(data.columns)}")
+        data = data[column].values
+    
+    # Convert to numpy array
+    data = np.array(data)
+    N = len(data)
+    
+    if N == 0:
+        return np.array([])
+    
+    envelope = np.zeros(N)
+    half = window_size  # 기존 코드와 동일하게 window_size를 half로 사용
+    
+    for i in range(N):
+        start = max(0, i - half)
+        end = min(N, i + half + 1)
+        envelope[i] = np.percentile(data[start:end], percentile)
+    
+    # Apply additional smoothing if requested
+    if smooth_window is not None and smooth_window > 1:
+        if smooth_method == 'moving_average':
+            # Moving average smoothing with better edge handling
+            from scipy.ndimage import uniform_filter1d
+            # Use 'reflect' mode for better edge handling (more uniform smoothing)
+            # Apply multiple passes for smoother result (reduces step-wise artifacts)
+            envelope = uniform_filter1d(envelope, size=smooth_window, mode='reflect')
+            # Second pass with smaller window for fine smoothing
+            if smooth_window >= 5:
+                fine_window = max(3, smooth_window // 3)
+                envelope = uniform_filter1d(envelope, size=fine_window, mode='reflect')
+        elif smooth_method == 'savgol':
+            # Savitzky-Golay filter (polynomial smoothing)
+            # Ensure window is odd and not larger than data length
+            smooth_window_odd = smooth_window if smooth_window % 2 == 1 else smooth_window + 1
+            smooth_window_odd = min(smooth_window_odd, N if N % 2 == 1 else N - 1)
+            if smooth_window_odd >= 3:
+                # Use higher polynomial order for smoother result
+                poly_order = min(3, smooth_window_odd - 1)  # polynomial order
+                envelope = savgol_filter(envelope, smooth_window_odd, poly_order)
+                # Apply second pass for extra smoothness (reduces step-wise artifacts)
+                if smooth_window_odd >= 7:
+                    second_window = max(5, smooth_window_odd - 4)
+                    second_window = second_window if second_window % 2 == 1 else second_window + 1
+                    second_window = min(second_window, N if N % 2 == 1 else N - 1)
+                    if second_window >= 3:
+                        envelope = savgol_filter(envelope, second_window, min(3, second_window - 1))
+        elif smooth_method == 'butterworth':
+            # Butterworth low-pass filter (frequency domain filter)
+            from scipy.signal import butter, filtfilt
+            # Normalize cutoff frequency (0.0 to 1.0, where 1.0 is Nyquist frequency)
+            # smooth_window을 cutoff frequency로 해석: 작을수록 더 부드러움
+            # 예: smooth_window=21이면 cutoff ≈ 1/21 ≈ 0.05 (매우 낮은 주파수만 통과)
+            nyquist = 0.5
+            cutoff = min(0.4, max(0.01, 1.0 / smooth_window))  # cutoff frequency
+            b, a = butter(4, cutoff, btype='low', analog=False)  # 4th order Butterworth
+            envelope = filtfilt(b, a, envelope)  # zero-phase filtering (forward + backward)
+        else:
+            raise ValueError(f"Unknown smooth_method: {smooth_method}. Use 'moving_average', 'savgol', or 'butterworth'")
+    
+    return envelope
+
+
+def filter_Vcorr_single(df,
+                        window_size=7,         # upper envelope window
+                        percentile=97,         # upper envelope percentile
+                        I_rest_threshold=0.02, # define rest
+                        alpha=0.97,            # smoothing for non-rest only
+                        Vcorr_col='Vcorr',
+                        I_col='current',
+                        smooth_window=None,     # additional smoothing window (None = no smoothing)
+                        smooth_method='moving_average'):  # 'moving_average' or 'savgol'
+    """
+    Apply Vcorr regime-based filtering to a single DataFrame.
+    
+    Filtering algorithm:
+    1. Extract upper envelope using sliding window percentile
+    2. Apply regime-based filtering:
+       - REST regime (|I| < threshold): use raw Vcorr (no smoothing)
+       - DRIVING/PULSE regime (|I| >= threshold): use upper envelope + smoothing
+    
+    Args:
+        df: pandas DataFrame with Vcorr and current columns
+        window_size: int, upper envelope window size
+        percentile: float, upper envelope percentile (0-100)
+        I_rest_threshold: float, current threshold for rest detection
+        alpha: float, smoothing parameter for non-rest only
+        Vcorr_col: str, name of Vcorr column
+        I_col: str, name of current column
+    
+    Returns:
+        df_filtered: pandas DataFrame with filtered Vcorr column
+    """
+    df_copy = df.copy()
+    
+    if Vcorr_col not in df_copy.columns or I_col not in df_copy.columns:
+        return df_copy
+        
+    Vcorr = df_copy[Vcorr_col].values
+    I = df_copy[I_col].values
+    N = len(Vcorr)
+    
+    # Step 1 — Upper envelope extraction
+    Vupper = extract_upper_envelope(Vcorr, window_size, percentile, 
+                                    smooth_window=smooth_window, 
+                                    smooth_method=smooth_method)
+    
+    # Step 2 — Initialize Vslow
+    Vslow = np.zeros(N)
+    Vslow[0] = Vcorr[0]   # 초기값은 raw 그대로
+    
+    # Step 3 — Regime-based filtering
+    for i in range(1, N):
+        if abs(I[i]) < I_rest_threshold:
+            # ===== REST 구간: smoothing 완전히 끄고 raw 사용 =====
+            Vslow[i] = Vcorr[i]
+        else:
+            # ===== PULSE/DRIVING 구간: upper envelope + smoothing =====
+            Vslow[i] = alpha * Vslow[i-1] + (1 - alpha) * Vupper[i]
+    
+    # Update Vcorr column with filtered values
+    df_copy[Vcorr_col] = Vslow
+    return df_copy
+
+
+def filter_Vcorr_lpf_single(df,
+                             I_rest_threshold=0.02,  # current threshold for rest detection
+                             alpha=0.005,            # LPF smoothing parameter (small value for smooth transition)
+                             Vcorr_col='Vcorr',
+                             I_col='current'):
+    """
+    Apply hybrid rest + LPF filtering to a single DataFrame.
+    
+    Filtering algorithm:
+    1. Find rest regions where |I| < I_rest_threshold (anchors)
+    2. Use raw Vcorr at rest points (anchoring)
+    3. Fill between rest points with LPF: Vslow(t) = (1-α)*Vslow(t-1) + α*Vcorr(t)
+    4. Fill tail after last rest with LPF
+    
+    Args:
+        df: pandas DataFrame with Vcorr and current columns
+        I_rest_threshold: float, current threshold for rest detection
+        alpha: float, LPF smoothing parameter (small value, e.g., 0.005 for smooth transition)
+        Vcorr_col: str, name of Vcorr column
+        I_col: str, name of current column
+    
+    Returns:
+        df_filtered: pandas DataFrame with filtered Vcorr column
+    """
+    df_copy = df.copy()
+    
+    if Vcorr_col not in df_copy.columns or I_col not in df_copy.columns:
+        return df_copy
+        
+    Vcorr = df_copy[Vcorr_col].values
+    I = df_copy[I_col].values
+    N = len(Vcorr)
+    
+    Vslow = np.zeros_like(Vcorr)
+    
+    # 1) rest index 추출 (앵커)
+    rest_mask = np.abs(I) < I_rest_threshold
+    rest_indices = np.where(rest_mask)[0]
+    
+    # 보호: rest가 없다면 그냥 LPF 반환
+    if len(rest_indices) == 0:
+        Vslow[0] = Vcorr[0]
+        for t in range(1, N):
+            Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * Vcorr[t]
+        df_copy[Vcorr_col] = Vslow
+        return df_copy
+    
+    # 2) 모든 rest 지점에서 raw Vcorr 사용 (앵커 고정, 손대지 않음)
+    for rest_idx in rest_indices:
+        Vslow[rest_idx] = Vcorr[rest_idx]
+    
+    # 3) 첫 rest 이전 구간 처리 (0부터 첫 rest까지)
+    first_rest = rest_indices[0]
+    if first_rest > 0:
+        # 첫 rest 값에 수렴하도록 backward LPF
+        Vslow[0] = Vcorr[0]
+        for t in range(1, first_rest):
+            # 목표: first_rest의 값에 가까워지도록
+            target = Vcorr[first_rest]
+            progress = t / first_rest  # 0에서 1로
+            # 더 부드러운 전환을 위해 가중치 조정
+            Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * (Vcorr[t] * (1 - progress * 0.5) + target * progress * 0.5)
+    
+    # 4) rest 구간 사이를 LPF로 채우기 (양방향으로 부드럽게 연결)
+    for i in range(len(rest_indices) - 1):
+        k0 = rest_indices[i]
+        k1 = rest_indices[i+1]
+        
+        # k0와 k1은 이미 앵커로 고정됨 (raw Vcorr)
+        # k0~k1 사이를 부드럽게 연결
+        if k1 - k0 > 1:
+            # 선형 보간으로 먼저 초기 추정값 생성 (매우 부드러운 베이스라인)
+            linear_base = np.linspace(Vcorr[k0], Vcorr[k1], k1 - k0 + 1)
+            
+            # Forward pass: k0에서 시작해서 k1 방향으로
+            Vslow_forward = np.zeros(k1 - k0 + 1)
+            Vslow_forward[0] = Vcorr[k0]  # 앵커
+            for t in range(k0 + 1, k1):
+                idx = t - k0
+                # 선형 보간 30% 사용 (30% 선형 보간 + 70% LPF)
+                linear_val = linear_base[idx]
+                Vslow_forward[idx] = (1 - alpha) * Vslow_forward[idx - 1] + alpha * (linear_val * 0.3 + Vcorr[t] * 0.7)
+            
+            # Backward pass: k1에서 시작해서 k0 방향으로
+            Vslow_backward = np.zeros(k1 - k0 + 1)
+            Vslow_backward[-1] = Vcorr[k1]  # 앵커
+            for t in range(k1 - 1, k0, -1):
+                idx = t - k0
+                # 선형 보간 30% 사용
+                linear_val = linear_base[idx]
+                Vslow_backward[idx] = (1 - alpha) * Vslow_backward[idx + 1] + alpha * (linear_val * 0.3 + Vcorr[t] * 0.7)
+            
+            # Forward와 backward의 균등 평균 (더 부드러운 연결)
+            for t in range(k0 + 1, k1):
+                idx = t - k0
+                # 선형 보간도 함께 고려
+                linear_val = linear_base[idx]
+                # 3-way 평균: forward, backward, linear
+                Vslow[t] = 0.4 * Vslow_forward[idx] + 0.4 * Vslow_backward[idx] + 0.2 * linear_val
+            
+            # 추가 smoothing: 인접한 값들의 평균 (step-wise 제거)
+            if k1 - k0 > 3:
+                for t in range(k0 + 1, k1):
+                    # 양쪽 인접 값과의 가중 평균
+                    if t > k0 + 1 and t < k1 - 1:
+                        Vslow[t] = 0.5 * Vslow[t] + 0.25 * Vslow[t-1] + 0.25 * Vslow[t+1]
+                    elif t == k0 + 1:
+                        Vslow[t] = 0.6 * Vslow[t] + 0.4 * Vslow[t+1]
+                    elif t == k1 - 1:
+                        Vslow[t] = 0.6 * Vslow[t] + 0.4 * Vslow[t-1]
+    
+    # 5) 마지막 rest 이후 tail 구간도 LPF
+    last_rest = rest_indices[-1]
+    if last_rest < N - 1:
+        Vslow[last_rest] = Vcorr[last_rest]  # 앵커 유지
+        for t in range(last_rest + 1, N):
+            Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * Vcorr[t]
+    
+    # Update Vcorr column with filtered values
+    df_copy[Vcorr_col] = Vslow
+    return df_copy
+
+
+def filter_Vcorr_lpf_regime(extracted_data,
+                            I_rest_threshold=0.02,  # current threshold for rest detection
+                            alpha=0.005,            # LPF smoothing parameter (small value for smooth transition)
+                            Vcorr_col='Vcorr',
+                            I_col='current'):
+    """
+    Apply hybrid rest + LPF filtering and merge drivingonly + restonly profiles.
+    
+    Process:
+    1. Extract all drivingonly profiles (udds2_1c_drivingonly_25C_SOC_##)
+    2. Apply hybrid rest + LPF to drivingonly profiles
+    3. Extract all restonly profiles (udds2_1c_restonly_25C_SOC_##)
+    4. Apply hybrid rest + LPF to restonly profiles
+    5. Match drivingonly and restonly by SOC_## number
+    6. Concatenate matched profiles (rest time starts from driving end time + 1s)
+    7. Return as list of DataFrames
+    
+    Filtering algorithm:
+    1. Find rest regions where |I| < I_rest_threshold (anchors)
+    2. Use raw Vcorr at rest points (anchoring)
+    3. Fill between rest points with LPF: Vslow(t) = (1-α)*Vslow(t-1) + α*Vcorr(t)
+    4. Fill tail after last rest with LPF
+    
+    Input:
+        extracted_data: dict with keys like 'udds2_1c_drivingonly_25C_SOC_53' and DataFrame values
+        I_rest_threshold: float, current threshold for rest detection
+        alpha: float, LPF smoothing parameter (small value, e.g., 0.005)
+        Vcorr_col: str, name of Vcorr column
+        I_col: str, name of current column
+    
+    Output:
+        merged_list_filtered, merged_list_original: tuple of two lists
+            - merged_list_filtered: list of DataFrames with hybrid rest + LPF applied
+            - merged_list_original: list of DataFrames with only merge (no filtering)
+        
+        If input is a DataFrame, returns (filtered_df, original_df)
+    """
+    import re
+    import pandas as pd
+    
+    # If input is a single DataFrame, apply filter and return both original and filtered
+    if isinstance(extracted_data, pd.DataFrame):
+        filtered_df = filter_Vcorr_lpf_single(extracted_data, I_rest_threshold, alpha, Vcorr_col, I_col)
+        return filtered_df, extracted_data.copy()  # (filtered, original)
+    
+    if not isinstance(extracted_data, dict):
+        raise ValueError("extracted_data must be a dictionary or DataFrame")
+    
+    # Pattern to match drivingonly and restonly profiles
+    driving_pattern = r'udds\d+_1c_drivingonly_\d+C_SOC_(\d+)'
+    rest_pattern = r'udds\d+_1c_restonly_\d+C_SOC_(\d+)'
+    
+    # Step 1 & 2: Extract drivingonly profiles (both original and filtered)
+    driving_dict = {}  # key: SOC number, value: filtered DataFrame
+    driving_dict_orig = {}  # key: SOC number, value: original DataFrame (no filtering)
+    for key, df in extracted_data.items():
+        match = re.search(driving_pattern, key)
+        if match:
+            soc_num = match.group(1)
+            filtered_df = filter_Vcorr_lpf_single(df, I_rest_threshold, alpha, Vcorr_col, I_col)
+            driving_dict[soc_num] = filtered_df
+            driving_dict_orig[soc_num] = df.copy()  # 원본 저장
+    
+    # Step 3 & 4: Extract restonly profiles (both original and filtered)
+    rest_dict = {}  # key: SOC number, value: filtered DataFrame
+    rest_dict_orig = {}  # key: SOC number, value: original DataFrame (no filtering)
+    for key, df in extracted_data.items():
+        match = re.search(rest_pattern, key)
+        if match:
+            soc_num = match.group(1)
+            filtered_df = filter_Vcorr_lpf_single(df, I_rest_threshold, alpha, Vcorr_col, I_col)
+            rest_dict[soc_num] = filtered_df
+            rest_dict_orig[soc_num] = df.copy()  # 원본 저장
+    
+    # Helper function to merge profiles
+    def merge_profiles(driving_dict_merge, rest_dict_merge):
+        merged_list = []
+        time_col = 'time'
+        
+        # Find all SOC numbers that exist in both dictionaries
+        common_soc = set(driving_dict_merge.keys()) & set(rest_dict_merge.keys())
+        
+        for soc_num in sorted(common_soc):
+            driving_df = driving_dict_merge[soc_num].copy()
+            rest_df = rest_dict_merge[soc_num].copy()
+            
+            # Ensure time column exists
+            if time_col not in driving_df.columns or time_col not in rest_df.columns:
+                print(f"Warning: 'time' column not found for SOC_{soc_num}. Skipping.")
+                continue
+            
+            # Get the last time value from driving profile
+            driving_end_time = driving_df[time_col].max()
+            
+            # Reset rest profile time to start from driving_end_time + 1
+            rest_df[time_col] = rest_df[time_col] - rest_df[time_col].min() + driving_end_time + 1
+            
+            # Concatenate driving and rest DataFrames
+            merged_df = pd.concat([driving_df, rest_df], ignore_index=True)
+            merged_list.append(merged_df)
+        
+        # Add any driving-only profiles that don't have a matching rest profile
+        driving_only_soc = set(driving_dict_merge.keys()) - set(rest_dict_merge.keys())
+        for soc_num in sorted(driving_only_soc):
+            merged_list.append(driving_dict_merge[soc_num].copy())
+        
+        # Add any rest-only profiles that don't have a matching driving profile
+        rest_only_soc = set(rest_dict_merge.keys()) - set(driving_dict_merge.keys())
+        for soc_num in sorted(rest_only_soc):
+            merged_list.append(rest_dict_merge[soc_num].copy())
+        
+        return merged_list
+    
+    # Step 5 & 6: Merge filtered profiles (with 1st order LPF applied)
+    merged_list_filtered = merge_profiles(driving_dict, rest_dict)
+    
+    # Step 7: Merge original profiles (no filtering, just merge)
+    merged_list_original = merge_profiles(driving_dict_orig, rest_dict_orig)
+    
+    common_soc = set(driving_dict.keys()) & set(rest_dict.keys())
+    driving_only_soc = set(driving_dict.keys()) - set(rest_dict.keys())
+    rest_only_soc = set(rest_dict.keys()) - set(driving_dict.keys())
+    
+    print(f"Processed {len(common_soc)} matched pairs (driving+rest)")
+    print(f"Added {len(driving_only_soc)} driving-only profiles")
+    print(f"Added {len(rest_only_soc)} rest-only profiles")
+    print(f"Total merged profiles (filtered): {len(merged_list_filtered)}")
+    print(f"Total merged profiles (original): {len(merged_list_original)}")
+    
+    return merged_list_filtered, merged_list_original
+
+
+def filter_Vcorr_regime(extracted_data,
+                        window_size=7,         # upper envelope window
+                        percentile=97,         # upper envelope percentile
+                        I_rest_threshold=0.02, # define rest
+                        alpha=0.97,            # smoothing for non-rest only
+                        Vcorr_col='Vcorr',
+                        I_col='current',
+                        smooth_window=None,     # additional smoothing window (None = no smoothing)
+                        smooth_method='moving_average'):  # 'moving_average' or 'savgol'
+    """
+    Filter Vcorr regime and merge drivingonly + restonly profiles.
+    
+    Process:
+    1. Extract all drivingonly profiles (udds2_1c_drivingonly_25C_SOC_##)
+    2. Apply filtering algorithm to drivingonly profiles
+    3. Extract all restonly profiles (udds2_1c_restonly_25C_SOC_##)
+    4. Apply filtering algorithm to restonly profiles
+    5. Match drivingonly and restonly by SOC_## number
+    6. Concatenate matched profiles (rest time starts from driving end time + 1s)
+    7. Return as list of DataFrames
+    
+    Input:
+        extracted_data: dict with keys like 'udds2_1c_drivingonly_25C_SOC_53' and DataFrame values
+        window_size: int, upper envelope window
+        percentile: float, upper envelope percentile
+        I_rest_threshold: float, current threshold for rest detection (|I| < threshold = rest)
+        alpha: float, smoothing parameter for non-rest only
+        Vcorr_col: str, name of Vcorr column
+        I_col: str, name of current column
+    
+    Output:
+        merged_list_filtered, merged_list_original: tuple of two lists
+            - merged_list_filtered: list of DataFrames with extract_upper_envelope applied
+            - merged_list_original: list of DataFrames with only merge (no filtering)
+        
+        If input is a DataFrame, returns (filtered_df, original_df)
+    """
+    import re
+    import pandas as pd
+    
+    # If input is a single DataFrame, apply filter and return both original and filtered
+    if isinstance(extracted_data, pd.DataFrame):
+        filtered_df = filter_Vcorr_single(extracted_data, window_size, percentile, 
+                                          I_rest_threshold, alpha, Vcorr_col, I_col,
+                                          smooth_window, smooth_method)
+        return filtered_df, extracted_data.copy()  # (filtered, original)
+    
+    if not isinstance(extracted_data, dict):
+        raise ValueError("extracted_data must be a dictionary or DataFrame")
+    
+    # Pattern to match drivingonly and restonly profiles
+    driving_pattern = r'udds\d+_1c_drivingonly_\d+C_SOC_(\d+)'
+    rest_pattern = r'udds\d+_1c_restonly_\d+C_SOC_(\d+)'
+    
+    # Step 1 & 2: Extract drivingonly profiles (both original and filtered)
+    driving_dict = {}  # key: SOC number, value: filtered DataFrame
+    driving_dict_orig = {}  # key: SOC number, value: original DataFrame (no filtering)
+    for key, df in extracted_data.items():
+        match = re.search(driving_pattern, key)
+        if match:
+            soc_num = match.group(1)
+            filtered_df = filter_Vcorr_single(df, window_size, percentile, I_rest_threshold,
+                                              alpha, Vcorr_col, I_col,
+                                              smooth_window, smooth_method)
+            driving_dict[soc_num] = filtered_df
+            driving_dict_orig[soc_num] = df.copy()  # 원본 저장
+    
+    # Step 3 & 4: Extract restonly profiles (both original and filtered)
+    rest_dict = {}  # key: SOC number, value: filtered DataFrame
+    rest_dict_orig = {}  # key: SOC number, value: original DataFrame (no filtering)
+    for key, df in extracted_data.items():
+        match = re.search(rest_pattern, key)
+        if match:
+            soc_num = match.group(1)
+            filtered_df = filter_Vcorr_single(df, window_size, percentile, I_rest_threshold,
+                                              alpha, Vcorr_col, I_col,
+                                              smooth_window, smooth_method)
+            rest_dict[soc_num] = filtered_df
+            rest_dict_orig[soc_num] = df.copy()  # 원본 저장
+    
+    # Helper function to merge profiles
+    def merge_profiles(driving_dict_merge, rest_dict_merge):
+        merged_list = []
+        time_col = 'time'
+        
+        # Find all SOC numbers that exist in both dictionaries
+        common_soc = set(driving_dict_merge.keys()) & set(rest_dict_merge.keys())
+        
+        for soc_num in sorted(common_soc):
+            driving_df = driving_dict_merge[soc_num].copy()
+            rest_df = rest_dict_merge[soc_num].copy()
+            
+            # Ensure time column exists
+            if time_col not in driving_df.columns or time_col not in rest_df.columns:
+                print(f"Warning: 'time' column not found for SOC_{soc_num}. Skipping.")
+                continue
+            
+            # Get the last time value from driving profile
+            driving_end_time = driving_df[time_col].max()
+            
+            # Reset rest profile time to start from driving_end_time + 1
+            rest_df[time_col] = rest_df[time_col] - rest_df[time_col].min() + driving_end_time + 1
+            
+            # Concatenate driving and rest DataFrames
+            merged_df = pd.concat([driving_df, rest_df], ignore_index=True)
+            merged_list.append(merged_df)
+        
+        # Add any driving-only profiles that don't have a matching rest profile
+        driving_only_soc = set(driving_dict_merge.keys()) - set(rest_dict_merge.keys())
+        for soc_num in sorted(driving_only_soc):
+            merged_list.append(driving_dict_merge[soc_num].copy())
+        
+        # Add any rest-only profiles that don't have a matching driving profile
+        rest_only_soc = set(rest_dict_merge.keys()) - set(driving_dict_merge.keys())
+        for soc_num in sorted(rest_only_soc):
+            merged_list.append(rest_dict_merge[soc_num].copy())
+        
+        return merged_list
+    
+    # Step 5 & 6: Merge filtered profiles (with extract_upper_envelope applied)
+    merged_list_filtered = merge_profiles(driving_dict, rest_dict)
+    
+    # Step 7: Merge original profiles (no filtering, just merge)
+    merged_list_original = merge_profiles(driving_dict_orig, rest_dict_orig)
+    
+    common_soc = set(driving_dict.keys()) & set(rest_dict.keys())
+    driving_only_soc = set(driving_dict.keys()) - set(rest_dict.keys())
+    rest_only_soc = set(rest_dict.keys()) - set(driving_dict.keys())
+    
+    print(f"Processed {len(common_soc)} matched pairs (driving+rest)")
+    print(f"Added {len(driving_only_soc)} driving-only profiles")
+    print(f"Added {len(rest_only_soc)} rest-only profiles")
+    print(f"Total merged profiles (filtered): {len(merged_list_filtered)}")
+    print(f"Total merged profiles (original): {len(merged_list_original)}")
+    
+    return merged_list_filtered, merged_list_original
+
+
+
+
+
+
+
+
+def merge_udds(extracted_data):
+    """
+    Merge drivingonly and restonly DataFrames from dict with matching UDDS, temperature, and SOC levels.
+    
+    Args:
+        extracted_data: dict with keys like 'udds2_1c_drivingonly_25C_SOC_53' and DataFrame values
+    
+    Returns:
+        merged_df_list: list of pandas DataFrame, merged profiles (drivingonly + restonly)
+    """
+    # Helper function to extract profile info from name
+    def extract_profile_info(name):
+        """
+        Extract UDDS, temperature, and SOC from profile name
+        Example: 'udds2_1c_drivingonly_25C_SOC_53' -> ('udds2', '1c', '25C', '53', 'drivingonly')
+        """
+        # Pattern: udds{number}_{rate}c_{type}_{temp}C_SOC_{soc}
+        pattern = r'(udds\d+)_(\d+c)_(drivingonly|restonly)_(\d+C)_SOC_(\d+)'
+        match = re.search(pattern, name, re.IGNORECASE)
+        if match:
+            udds = match.group(1)
+            rate = match.group(2)
+            profile_type = match.group(3)
+            temp = match.group(4)
+            soc = match.group(5)
+            return (udds, rate, temp, soc, profile_type)
+        return None
+    
+    # Create dictionaries to store DataFrames by profile key
+    driving_dict = {}
+    rest_dict = {}
+    
+    # Process extracted_data dict
+    for key, df in extracted_data.items():
+        info = extract_profile_info(key)
+        if info:
+            udds, rate, temp, soc, profile_type = info
+            profile_key = (udds, rate, temp, soc)  # Key without drivingonly/restonly
+            
+            if profile_type.lower() == 'drivingonly':
+                driving_dict[profile_key] = df.copy()
+            elif profile_type.lower() == 'restonly':
+                rest_dict[profile_key] = df.copy()
+    
+    # Merge matching profiles
+    merged_df_list = []
+    time_col = 'time'
+    
+    # Find all unique keys that exist in both dictionaries
+    common_keys = set(driving_dict.keys()) & set(rest_dict.keys())
+    
+    for key in common_keys:
+        udds, rate, temp, soc = key
+        driving_df = driving_dict[key].copy()
+        rest_df = rest_dict[key].copy()
+        
+        # Ensure time column exists
+        if time_col not in driving_df.columns or time_col not in rest_df.columns:
+            print(f"Warning: 'time' column not found for SOC_{soc}. Skipping.")
+            continue
+        
+        # Get the last time value from driving profile
+        driving_end_time = driving_df[time_col].max()
+        
+        # Reset rest profile time to start from driving_end_time + 1
+        rest_df[time_col] = rest_df[time_col] - rest_df[time_col].min() + driving_end_time + 1
+        
+        # Concatenate driving and rest DataFrames
+        merged_df = pd.concat([driving_df, rest_df], ignore_index=True)
+        
+        merged_df_list.append(merged_df)
+    
+    # Add any driving-only profiles that don't have a matching rest profile
+    driving_only_keys = set(driving_dict.keys()) - set(rest_dict.keys())
+    for key in driving_only_keys:
+        merged_df_list.append(driving_dict[key].copy())
+    
+    # Add any rest-only profiles that don't have a matching driving profile
+    rest_only_keys = set(rest_dict.keys()) - set(driving_dict.keys())
+    for key in rest_only_keys:
+        merged_df_list.append(rest_dict[key].copy())
+    
+    print(f"Merged {len(common_keys)} pairs of driving+rest profiles")
+    print(f"Added {len(driving_only_keys)} driving-only profiles")
+    print(f"Added {len(rest_only_keys)} rest-only profiles")
+    print(f"Total merged profiles: {len(merged_df_list)}")
+    
+    return merged_df_list
+
+
+def plot_merged_udds(dict_list1, dict_list2, figsize=(15, 10)):
+    """
+    Plot two lists of dicts side by side, matching by index.
+    
+    Args:
+        dict_list1: list of dicts, each dict should contain 'time' and 'Vcorr' keys
+        dict_list2: list of dicts, each dict should contain 'time' and 'Vcorr' keys
+                   (should have same length as dict_list1)
+        figsize: tuple, figure size (width, height)
+    
+    Returns:
+        None (displays plot)
+    """
+    import matplotlib.pyplot as plt
+    
+    if len(dict_list1) != len(dict_list2):
+        raise ValueError(f"Two lists must have the same length. Got {len(dict_list1)} and {len(dict_list2)}")
+    
+    n_plots = len(dict_list1)
+    
+    # Calculate grid dimensions
+    n_cols = int(np.ceil(np.sqrt(n_plots)))
+    n_rows = int(np.ceil(n_plots / n_cols))
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    if n_plots == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+    
+    for idx in range(n_plots):
+        ax = axes[idx]
+        dict1 = dict_list1[idx]
+        dict2 = dict_list2[idx]
+        
+        # Extract time and Vcorr from first dict
+        if 'time' in dict1 and 'Vcorr' in dict1:
+            time1 = dict1['time']
+            vcorr1 = dict1['Vcorr']
+            
+            # Convert to numpy array if needed
+            if isinstance(time1, (list, tuple)):
+                time1 = np.array(time1)
+            if isinstance(vcorr1, (list, tuple)):
+                vcorr1 = np.array(vcorr1)
+            
+            ax.plot(time1, vcorr1, label='List 1', alpha=0.7, linewidth=1.5)
+        
+        # Extract time and Vcorr from second dict
+        if 'time' in dict2 and 'Vcorr' in dict2:
+            time2 = dict2['time']
+            vcorr2 = dict2['Vcorr']
+            
+            # Convert to numpy array if needed
+            if isinstance(time2, (list, tuple)):
+                time2 = np.array(time2)
+            if isinstance(vcorr2, (list, tuple)):
+                vcorr2 = np.array(vcorr2)
+            
+            ax.plot(time2, vcorr2, label='List 2', alpha=0.7, linewidth=1.5)
+        
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Vcorr')
+        ax.set_title(f'Index {idx}')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    # Hide unused subplots
+    for idx in range(n_plots, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return fig
+
+
+def plot_filtered_data(filtered_data, original_data=None, figsize=(15, 10), max_plots=None):
+    """
+    Plot filtered data from filter_Vcorr_regime function result, optionally with original data.
+    
+    Args:
+        filtered_data: list of DataFrames (result from filter_Vcorr_regime function)
+        original_data: dict with keys like 'udds2_1c_drivingonly_25C_SOC_##' and DataFrame values
+                      (optional, if provided, original Vcorr will be plotted together)
+        figsize: tuple, figure size (width, height)
+        max_plots: int or None, maximum number of plots to show (None = show all)
+    
+    Returns:
+        fig: matplotlib figure object
+    """
+    import matplotlib.pyplot as plt
+    import re
+    
+    if not isinstance(filtered_data, list):
+        raise ValueError("filtered_data must be a list of DataFrames")
+    
+    n_plots = len(filtered_data)
+    if max_plots is not None:
+        n_plots = min(n_plots, max_plots)
+        filtered_data = filtered_data[:n_plots]
+    
+    if n_plots == 0:
+        print("No data to plot")
+        return None
+    
+    # Extract original drivingonly data if provided
+    original_dict = {}
+    if original_data is not None and isinstance(original_data, dict):
+        driving_pattern = r'udds\d+_1c_drivingonly_\d+C_SOC_(\d+)'
+        for key, df in original_data.items():
+            match = re.search(driving_pattern, key)
+            if match:
+                soc_num = match.group(1)
+                original_dict[soc_num] = df
+    
+    # Calculate grid dimensions
+    n_cols = int(np.ceil(np.sqrt(n_plots)))
+    n_rows = int(np.ceil(n_plots / n_cols))
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
+    if n_plots == 1:
+        axes = [axes]
+    else:
+        axes = axes.flatten()
+    
+    # For each filtered DataFrame, try to find matching original by SOC
+    # filter_Vcorr_regime returns data sorted by SOC, so we match by index
+    for idx, filtered_df in enumerate(filtered_data):
+        ax = axes[idx]
+        
+        # Hold on to plot multiple lines on same axes
+        ax.hold = True  # For compatibility, though matplotlib handles this automatically
+        
+        if not isinstance(filtered_df, pd.DataFrame):
+            ax.text(0.5, 0.5, f'Not a DataFrame\nItem {idx}', 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Item {idx} (Invalid)')
+            continue
+        
+        if 'time' not in filtered_df.columns or 'Vcorr' not in filtered_df.columns:
+            ax.text(0.5, 0.5, f'Missing columns\nItem {idx}', 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(f'Item {idx} (No data)')
+            continue
+        
+        # Plot original data first (if available)
+        plot_original = False
+        if original_data is not None and len(original_dict) > 0:
+            # Get SOC numbers sorted (same order as filter_Vcorr_regime output)
+            soc_nums = sorted(original_dict.keys())
+            if idx < len(soc_nums):
+                soc_num = soc_nums[idx]
+                original_df = original_dict[soc_num]
+                
+                if isinstance(original_df, pd.DataFrame):
+                    if 'time' in original_df.columns and 'Vcorr' in original_df.columns:
+                        time_original = original_df['time'].values
+                        vcorr_original = original_df['Vcorr'].values
+                        
+                        # Plot original drivingonly data
+                        ax.plot(time_original, vcorr_original, 
+                               label='Original (drivingonly)', alpha=0.8, linewidth=2.0, 
+                               color='red', linestyle='--', marker='o', markersize=2)
+                        plot_original = True
+        
+        # Plot filtered data (on same axes)
+        time_filtered = filtered_df['time'].values
+        vcorr_filtered = filtered_df['Vcorr'].values
+        ax.plot(time_filtered, vcorr_filtered, 
+               label='Filtered (driving+rest)', alpha=0.8, linewidth=2.0, color='blue')
+        
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Vcorr (V)')
+        if plot_original:
+            ax.set_title(f'Item {idx} - SOC_{soc_num if "soc_num" in locals() else "?"}')
+        else:
+            ax.set_title(f'Item {idx}')
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3)
+    
+    # Hide unused subplots
+    for idx in range(n_plots, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    return fig

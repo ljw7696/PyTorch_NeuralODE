@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from GRU.battery_GRU_wrapper import prepare_profile_for_gru
 
@@ -18,36 +20,118 @@ from GRU.battery_GRU_wrapper import prepare_profile_for_gru
 class BatteryGRUWrapperTF(nn.Module):
     """
     GRU model wrapper for teacher forcing training.
-    Input: [V_spme_norm, ocv, Y, SOC, I, T] (6 features)
-    Output: delta_Vcorr prediction (normalized)
+    
+    Architecture: Bidirectional GRU → Unidirectional GRU → Dense Layers → Linear(1)
+    
+    Input: [V_spme_norm, ocv, SOC, I, T, Y] (6 features) at timestep k
+    Output: delta_Vcorr prediction (normalized) for timestep k+1
+    
+    Parameters:
+        gru1_hidden: Hidden size for bidirectional GRU (0 to skip)
+        gru2_hidden: Hidden size for unidirectional GRU (0 to skip)
+        dense1_hidden: Hidden size for first dense layer (0 to skip)
+        dense2_hidden: Hidden size for second dense layer (0 to skip)
     """
 
     def __init__(
         self,
         input_size: int = 6,
-        hidden_size: int = 6,
-        num_layers: int = 1,
+        gru1_hidden: int = 0,
+        gru2_hidden: int = 96,
+        dense1_hidden: int = 32,
+        dense2_hidden: int = 12,
         dropout: float = 0.0,
         device: Union[str, torch.device] = "cpu",
     ):
         super().__init__()
         self.device = torch.device(device)
 
-        self.gru = nn.GRU(
+        # Store architecture config for checkpoint
+        self.architecture_config = {
+            "input_size": input_size,
+            "gru1_hidden": gru1_hidden,
+            "gru2_hidden": gru2_hidden,
+            "dense1_hidden": dense1_hidden,
+            "dense2_hidden": dense2_hidden,
+        }
+
+        # Bidirectional GRU layer (skip if gru1_hidden == 0)
+        self.use_gru1 = gru1_hidden > 0
+        if self.use_gru1:
+            self.gru1 = nn.GRU(
             input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0.0,
+                hidden_size=gru1_hidden,
+                num_layers=1,
+                bidirectional=True,
             batch_first=True,
         )
-        self.head = nn.Linear(hidden_size, 1)
+        else:
+            self.gru1 = None
+        
+        # Unidirectional GRU layer (skip if gru2_hidden == 0)
+        self.use_gru2 = gru2_hidden > 0
+        if self.use_gru2:
+            # Determine input size for gru2
+            if self.use_gru1:
+                gru2_input_size = gru1_hidden * 2  # Bidirectional output
+            else:
+                gru2_input_size = input_size  # Skip gru1, use input directly
+            
+            self.gru2 = nn.GRU(
+                input_size=gru2_input_size,
+                hidden_size=gru2_hidden,
+                num_layers=1,
+                bidirectional=False,
+            batch_first=True,
+        )
+        else:
+            self.gru2 = None
+        
+        # Determine input size for dense layers
+        if self.use_gru2:
+            dense_input_size = gru2_hidden
+        elif self.use_gru1:
+            dense_input_size = gru1_hidden * 2  # Bidirectional output
+        else:
+            dense_input_size = input_size
+        
+        # Dense layers
+        self.use_dense1 = dense1_hidden > 0
+        if self.use_dense1:
+            self.dense1 = nn.Linear(dense_input_size, dense1_hidden)
+        else:
+            self.dense1 = None
+        
+        self.use_dense2 = dense2_hidden > 0
+        if self.use_dense2:
+            if self.use_dense1:
+                dense2_input_size = dense1_hidden
+            else:
+                dense2_input_size = dense_input_size
+            self.dense2 = nn.Linear(dense2_input_size, dense2_hidden)
+        else:
+            self.dense2 = None
+        
+        # Output layer (always present)
+        if self.use_dense2:
+            output_input_size = dense2_hidden
+        elif self.use_dense1:
+            output_input_size = dense1_hidden
+        else:
+            output_input_size = dense_input_size
+        
+        self.head = nn.Linear(output_input_size, 1)
+        
+        # Activation and dropout
+        self.activation = nn.ReLU()
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else None
 
         self.apply(self._init_weights)
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
-            nn.init.orthogonal_(module.weight, gain=0.7)
+            nn.init.orthogonal_(module.weight, gain=1.0)
             nn.init.constant_(module.bias, 0.0)
         elif isinstance(module, nn.GRU):
             for name, param in module.named_parameters():
@@ -58,430 +142,618 @@ class BatteryGRUWrapperTF(nn.Module):
                 elif "bias" in name:
                     nn.init.constant_(param.data, 0.0)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        outputs, _ = self.gru(inputs)
-        preds = self.head(outputs)
-        return preds
+    def forward(self, inputs: torch.Tensor, hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Forward pass.
+        
+        Args:
+            inputs: [batch_size, seq_len, 6] or [batch_size, 1, 6]
+            hidden: Optional tuple of (gru1_hidden, gru2_hidden) for state continuation
+        
+        Returns:
+            outputs: [batch_size, seq_len, 1] - delta_Vcorr predictions
+            hidden: Tuple of (gru1_hidden, gru2_hidden) for next timestep
+        """
+        batch_size = inputs.shape[0]
+        x = inputs
+        
+        gru1_hidden = None
+        gru2_hidden = None
+        
+        # Bidirectional GRU
+        if self.use_gru1:
+            if hidden is not None:
+                gru1_hidden_prev, _ = hidden
+                x, gru1_hidden = self.gru1(x, gru1_hidden_prev)
+            else:
+                x, gru1_hidden = self.gru1(x)  # [batch_size, seq_len, gru1_hidden * 2]
+        
+        # Unidirectional GRU
+        if self.use_gru2:
+            if hidden is not None:
+                _, gru2_hidden_prev = hidden
+                x, gru2_hidden = self.gru2(x, gru2_hidden_prev)
+            else:
+                x, gru2_hidden = self.gru2(x)  # [batch_size, seq_len, gru2_hidden]
+        
+        # If no GRU layers, create dummy hidden states
+        if gru1_hidden is None:
+            if self.use_gru1:
+                num_layers1 = self.gru1.num_layers
+                hidden_size1 = self.gru1.hidden_size
+                gru1_hidden = torch.zeros(
+                    num_layers1 * 2, batch_size, hidden_size1,
+                    device=x.device, dtype=x.dtype
+                )
+            else:
+                gru1_hidden = torch.zeros(2, batch_size, 1, device=x.device, dtype=x.dtype)
+        
+        if gru2_hidden is None:
+            if self.use_gru2:
+                num_layers2 = self.gru2.num_layers
+                hidden_size2 = self.gru2.hidden_size
+                gru2_hidden = torch.zeros(
+                    num_layers2, batch_size, hidden_size2,
+                    device=x.device, dtype=x.dtype
+                )
+            else:
+                gru2_hidden = torch.zeros(1, batch_size, 1, device=x.device, dtype=x.dtype)
+        
+        # Apply dense layers to each timestep
+        feature_dim = x.shape[-1]
+        x_flat = x.reshape(-1, feature_dim)
+        
+        # Dense layers
+        if self.use_dense1:
+            x_flat = self.activation(self.dense1(x_flat))
+            if self.dropout is not None:
+                x_flat = self.dropout(x_flat)
+        
+        if self.use_dense2:
+            x_flat = self.activation(self.dense2(x_flat))
+            if self.dropout is not None:
+                x_flat = self.dropout(x_flat)
+        
+        # Output layer
+        preds_flat = self.head(x_flat)  # [batch * seq_len, 1]
+        
+        # Reshape back to [batch, seq_len, 1]
+        seq_len = inputs.shape[1]
+        outputs = preds_flat.reshape(batch_size, seq_len, 1)
+        
+        return outputs, (gru1_hidden, gru2_hidden)
 
 
-def _prepare_profile_tensors_tf(
-    profile: Dict[str, Any], device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor, int, float, float]:
+def _prepare_profile_tensors_tf(profile: Dict[str, Any], device: torch.device) -> Tuple[Dict[str, Any], torch.Tensor, torch.Tensor]:
     """Prepare profile data for teacher forcing training."""
     prepared = prepare_profile_for_gru(profile)
-    
+
+    # Build feature array: [V_spme_norm, ocv, SOC, I, T, Y] at timestep k
     feature_array = np.stack(
         [
             prepared["V_spme_norm"],
             prepared["ocv"],
-            prepared["Y"],
             prepared["SOC"],
             prepared["I"],
             prepared["T"],
+            prepared["Y"],  # Teacher forcing: use true Y(k) value
         ],
         axis=-1,
     )
-    
+
     feature_tensor = torch.from_numpy(feature_array).to(device, dtype=torch.float32)  # [T, 6]
     y_norm = torch.from_numpy(prepared["Y"]).to(device, dtype=torch.float32)  # [T]
-    valid_length = len(feature_array)
     
-    return feature_tensor, y_norm, valid_length, prepared["Y_mean"], prepared["Y_std"]
+    return prepared, feature_tensor, y_norm
 
 
-def _gru_autoregressive_rollout_tf(
-    model: BatteryGRUWrapperTF,
-    feature_array: np.ndarray,
-    initial_y: np.ndarray,
-    window_len: int,
-    predict_delta: bool,
-    device: torch.device,
-) -> np.ndarray:
-    """Autoregressive rollout for inference (uses predictions, not ground truth)."""
-    features_autoreg = feature_array.copy()
-    total_steps = feature_array.shape[0]
-    preds_norm = np.full(total_steps, np.nan, dtype=np.float32)
-    warmup = min(window_len, total_steps)
-    preds_norm[:warmup] = initial_y[:warmup]
-
-    model.eval()
-    with torch.no_grad():
-        for idx in range(window_len, total_steps):
-            window_np = features_autoreg[idx - window_len : idx]
-            window_tensor = torch.from_numpy(window_np).unsqueeze(0).to(
-                device, dtype=torch.float32
-            )  # [1, window_len, 6]
-            
-            preds_seq = model(window_tensor)  # [1, window_len, 1]
-            pred_delta = preds_seq[0, -1, 0].cpu().numpy()  # Last timestep prediction
-            
-            if predict_delta:
-                preds_norm[idx] = preds_norm[idx - 1] + pred_delta
-            else:
-                preds_norm[idx] = pred_delta
-            
-            # Update features for next step (autoregressive: use prediction)
-            features_autoreg[idx, 2] = preds_norm[idx]
-
-    return preds_norm
-
-
-def _gru_autoregressive_rollout_train_batch_tf(
-    model: BatteryGRUWrapperTF,
-    features_batch: torch.Tensor,  # [batch_size, max_length, 6]
-    y_norm_batch: torch.Tensor,  # [batch_size, max_length]
-    valid_mask: torch.Tensor,  # [batch_size, max_length]
-    window_len: int,
-    predict_delta: bool,
-) -> torch.Tensor:
-    """
-    Teacher forcing: window_len만큼의 정답값을 사용해서 다음 타임스텝 하나만 예측.
-    ResNet처럼 각 타임스텝마다 독립적으로 처리하되, window를 사용.
-    
-    예: window_len=20이면, k=0~19의 정답값을 보고, delta_Vcorr_pred(20)을 계산
-    Vcorr_pred(21) = Vcorr(20) + delta_Vcorr_pred(20)
-    
-    Returns predictions: [batch_size, max_length]
-    """
-    batch_size, max_length, _ = features_batch.shape
-    device = features_batch.device
-    
-    # Initialize predictions with initial values
-    pred_y_norm_batch = torch.zeros_like(y_norm_batch)  # [batch_size, max_length]
-    pred_y_norm_batch[:, :window_len] = y_norm_batch[:, :window_len]  # Copy initial window_len values
-    
-    # Find max valid length across all profiles
-    valid_lengths = valid_mask.sum(dim=1)  # [batch_size]
-    max_valid_length = valid_lengths.max().item()
-    
-    if max_valid_length <= window_len:
-        return pred_y_norm_batch
-    
-    # Teacher forcing: 각 타임스텝마다 window_len만큼의 정답값을 사용해서 다음 타임스텝 하나만 예측
-    # ResNet처럼 각 타임스텝마다 독립적으로 처리 (GPU 효율적)
-    # 모든 프로파일을 배치로 처리하여 GPU 최대 활용
-    for k in range(window_len, max_valid_length):
-        # Build batch of windows: all profiles at timestep k
-        # Window: [k-window_len : k] (정답값 사용)
-        # clone()은 필요: Y 값을 수정해야 하므로
-        windows_batch = features_batch[:, k - window_len : k, :].clone()  # [batch_size, window_len, 6]
-        
-        # Teacher forcing: use ground truth Y values in windows
-        windows_batch[:, :, 2] = y_norm_batch[:, k - window_len : k]
-        
-        # Check which profiles are valid at this timestep
-        valid_at_k = (k < valid_lengths) & ((k - window_len) >= 0)
-        if not valid_at_k.any():
-            continue
-        
-        # Predict delta for next timestep (k+1) for all profiles simultaneously
-        preds_seq = model(windows_batch)  # [batch_size, window_len, 1]
-        pred_delta_batch = preds_seq[:, -1, :].squeeze(-1)  # [batch_size] - 마지막 timestep의 예측값
-        
-        # Update predictions: Vcorr_pred(k+1) = Vcorr(k) + delta_Vcorr_pred(k)
-        if predict_delta:
-            pred_y_norm_batch[:, k] = torch.where(
-                valid_at_k,
-                y_norm_batch[:, k - 1] + pred_delta_batch,  # Teacher forcing: Vcorr(k)는 정답값 사용
-                pred_y_norm_batch[:, k]
-            )
-        else:
-            pred_y_norm_batch[:, k] = torch.where(
-                valid_at_k,
-                pred_delta_batch,
-                pred_y_norm_batch[:, k]
-            )
-        
-        # 메모리 정리
-        del preds_seq
-    
-    return pred_y_norm_batch
-
-
-def _batch_teacher_forcing_train_pass(
+def _calculate_autoregressive_rmse_tf(
     model: BatteryGRUWrapperTF,
     profile_list: Sequence[Dict[str, Any]],
-    window_len: int,
-    predict_delta: bool,
     device: torch.device,
-    training_batch_size: Optional[int] = None,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
+) -> Dict[str, float]:
     """
-    Process multiple profiles in batch with teacher forcing.
-    Teacher forcing: window_len만큼의 정답값을 사용해서 다음 타임스텝 하나만 예측.
-    모든 프로파일을 배치로 처리하여 GPU 효율적으로 계산.
-    
-    1. 프로파일별로 GPU에 올림 (이게 batch)
-    2. 각 프로파일 내에서 window를 슬라이딩하며 각 타임스텝마다 하나씩 예측
-    3. 끝나면 Vpred 값들이 리턴됨
-    4. 밖에서 loss 계산
-    
-    OOM 방지를 위해 프로파일을 작은 sub-batch로 나눠서 처리합니다.
+    Calculate auto-regressive RMSE for validation profiles.
+    Each profile is processed independently with full auto-regressive rollout.
     """
+    model.eval()
+    
+    if not profile_list:
+        return {"avg_rmse_mV": float("nan"), "rmse_list": []}
+    
+    rmse_list: List[float] = []
+    y_std_list: List[float] = []
+    pred_all: List[np.ndarray] = []
+    target_all: List[np.ndarray] = []
+    time_all: List[np.ndarray] = []
+    
+    with torch.no_grad():
+        for profile in profile_list:
+            prepared, feature_tensor, y_norm = _prepare_profile_tensors_tf(profile, device)
+            total_steps = y_norm.shape[0]
+            
+            if total_steps <= 1:
+                continue
+            
+            # Initialize predictions
+            pred_y_norm = y_norm.clone()  # Start with true values
+            features_autoreg = feature_tensor.clone()  # [T, 6]
+            
+            # Initialize hidden states
+            gru1_hidden = None
+            gru2_hidden = None
+            
+            # Auto-regressive rollout: k=0 to k=total_steps-2 (predict k+1)
+            for k in range(total_steps - 1):
+                # Get input at timestep k: [1, 1, 6]
+                input_k = features_autoreg[k:k+1, :].unsqueeze(0)  # [1, 1, 6]
+                # Use predicted value (auto-regressive)
+                input_k[0, 0, 5] = pred_y_norm[k]  # Y(k) = predicted value
+                
+                # Forward pass
+                if gru1_hidden is None:
+                    preds_seq, (gru1_hidden, gru2_hidden) = model(input_k, hidden=None)
+                else:
+                    preds_seq, (gru1_hidden, gru2_hidden) = model(input_k, hidden=(gru1_hidden, gru2_hidden))
+                
+                # Get prediction: delta_Vcorr(k+1)
+                pred_delta = preds_seq[0, 0, 0].item()
+                
+                # Update predicted Y(k+1)
+                pred_y_norm[k + 1] = pred_y_norm[k] + pred_delta
+                features_autoreg[k + 1, 5] = pred_y_norm[k + 1]
+            
+            # Calculate RMSE (exclude first timestep)
+            if total_steps > 1:
+                pred_valid = pred_y_norm[1:].cpu().numpy()
+                target_valid = y_norm[1:].cpu().numpy()
+                time_valid = prepared["time"][1:]  # Time array (exclude first timestep)
+                
+                rmse_norm = float(np.sqrt(np.mean((pred_valid - target_valid) ** 2)))
+                y_std = prepared["Y_std"]
+                rmse_mV = rmse_norm * y_std * 1000
+                
+                rmse_list.append(rmse_mV)
+                y_std_list.append(y_std)
+                
+                # Store for time-segmented RMSE calculation
+                pred_all.append(pred_valid)
+                target_all.append(target_valid)
+                time_all.append(time_valid)
+    
+    avg_rmse_mV = float(np.nanmean(rmse_list)) if rmse_list else float("nan")
+    
+    # Calculate time-segmented RMSE
+    time_segments = [30, 60, 120, 180, 300, 600, 900, 1200, float("inf")]
+    time_segmented_rmse = {}
+    
+    if pred_all:
+        pred_flat = np.concatenate(pred_all)
+        target_flat = np.concatenate(target_all)
+        time_flat = np.concatenate(time_all)
+        
+        for t_max in time_segments:
+            mask = time_flat <= t_max
+            if mask.any():
+                rmse_seg = float(np.sqrt(np.mean((pred_flat[mask] - target_flat[mask]) ** 2)))
+                avg_y_std = float(np.nanmean(y_std_list)) if y_std_list else 1.0
+                rmse_seg_mV = rmse_seg * avg_y_std * 1000
+                label = f"{int(t_max)}s" if t_max != float("inf") else "all"
+                time_segmented_rmse[label] = rmse_seg_mV
+        
+        # Calculate rest RMSE (after 1730s)
+        mask_rest = time_flat > 1730
+        if mask_rest.any():
+            rmse_rest = float(np.sqrt(np.mean((pred_flat[mask_rest] - target_flat[mask_rest]) ** 2)))
+            avg_y_std = float(np.nanmean(y_std_list)) if y_std_list else 1.0
+            rmse_rest_mV = rmse_rest * avg_y_std * 1000
+            time_segmented_rmse["rest_after_1730s"] = rmse_rest_mV
+    
+    return {
+        "avg_rmse_mV": avg_rmse_mV,
+        "rmse_list": rmse_list,
+        "time_segmented_rmse": time_segmented_rmse,
+    }
+
+
+def _train_pass_tbptt_tf(
+    model: BatteryGRUWrapperTF,
+    profile_list: Sequence[Dict[str, Any]],
+    device: torch.device,
+    tbptt_length: int = 200,
+    verbose: bool = False,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    teacher_forcing_ratio: float = 1.0,
+) -> Dict[str, float]:
+    """
+    TBPTT training pass for teacher forcing with scheduled sampling.
+    
+    Input: x(k) = [V_spme_norm(k), ocv(k), SOC(k), I(k), T(k), Y(k)] at timestep k
+    Target: Y(k+1) (next timestep)
+    Hidden state flows from t=0 to profile end.
+    
+    Args:
+        teacher_forcing_ratio: Probability of using true value (1.0 = pure TF, 0.0 = pure autoregressive)
+    """
+    model.train()
+    
+    if not profile_list:
+        return {"num_steps": 0, "rmse_mV": float("nan"), "total_loss": 0.0}
+    
     # Prepare all profiles
     profile_data = []
     for profile in profile_list:
-        feature_tensor, y_norm, total_steps, y_mean, y_std = _prepare_profile_tensors_tf(profile, device)
-        if total_steps <= window_len:
-            continue
+        prepared, feature_tensor, y_norm = _prepare_profile_tensors_tf(profile, device)
+        total_steps = y_norm.shape[0]
+        if total_steps <= 1:
+            continue  # Need at least 2 timesteps (k and k+1)
         profile_data.append({
-            "features": feature_tensor,  # [T, 6]
-            "y_norm": y_norm,  # [T]
+            "prepared": prepared,
+            "features": feature_tensor,  # [total_steps, 6]
+            "y_norm": y_norm,  # [total_steps]
             "total_steps": total_steps,
-            "y_mean": y_mean,
-            "y_std": y_std,
         })
     
     if not profile_data:
-        dummy_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        return dummy_loss, {"num_windows": 0, "rmse_mV": float("nan")}
+        return {"num_steps": 0, "rmse_mV": float("nan"), "total_loss": 0.0}
     
-    # OOM 방지: 프로파일을 작은 sub-batch로 나눠서 처리
-    # ResNet처럼 각 타임스텝마다 독립적으로 처리하므로 메모리 효율적
-    # training_batch_size가 제공되면 그것을 sub_batch_size로 사용
-    # ResNet처럼 프로파일 샘플링은 하지 않고, sub_batch_size로만 제어
-    if training_batch_size is not None:
-        # 사용자가 지정한 batch_size를 sub_batch_size로 사용
-        sub_batch_size = min(training_batch_size, len(profile_data))
-    else:
-        # 기본값: ResNet과 비슷하게 큰 배치 사용 가능 (각 타임스텝마다 독립 처리)
-        sub_batch_size = min(128, len(profile_data))
+    # Pad profiles to same length for batch processing
+    max_length = max(p["total_steps"] for p in profile_data)
+    batch_size_actual = len(profile_data)
     
-    all_losses: List[torch.Tensor] = []
-    all_num_valid = 0
-    all_sum_sq_norm = 0.0
-    all_y_stds: List[float] = []
+    # Create batch tensors
+    features_batch = torch.zeros(batch_size_actual, max_length, 6, device=device)
+    y_norm_batch = torch.zeros(batch_size_actual, max_length, device=device)
+    valid_mask = torch.zeros(batch_size_actual, max_length, dtype=torch.bool, device=device)
+    pred_y_norm_batch = torch.zeros(batch_size_actual, max_length, device=device)  # For scheduled sampling
+    y_std_list = []
     
-    # Process profiles in sub-batches
-    for sub_batch_start in range(0, len(profile_data), sub_batch_size):
-        sub_batch_end = min(sub_batch_start + sub_batch_size, len(profile_data))
-        sub_batch_profiles = profile_data[sub_batch_start:sub_batch_end]
-        
-        # Prepare batch tensors with padding (like ResNet)
-        batch_size = len(sub_batch_profiles)
-        max_length = max(prof["total_steps"] for prof in sub_batch_profiles)
-        
-        # 메모리 최적화: 필요한 만큼만 할당
-        features_batch = torch.zeros(batch_size, max_length, 6, dtype=torch.float32, device=device)
-        y_norm_batch = torch.zeros(batch_size, max_length, dtype=torch.float32, device=device)
-        valid_mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=device)
-        
-        for i, prof in enumerate(sub_batch_profiles):
-            valid_len = prof["total_steps"]
-            features_batch[i, :valid_len] = prof["features"]
-            y_norm_batch[i, :valid_len] = prof["y_norm"]
-            valid_mask[i, :valid_len] = True
-        
-        # GPU 메모리 정리 (sub-batch 처리 전)
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        
-        # Perform batch autoregressive rollout with teacher forcing
-        pred_y_norm_batch = _gru_autoregressive_rollout_train_batch_tf(
-            model=model,
-            features_batch=features_batch,
-            y_norm_batch=y_norm_batch,
-            valid_mask=valid_mask,
-            window_len=window_len,
-            predict_delta=predict_delta,
-        )  # Shape: [batch_size, max_length]
-        
-        # Calculate loss on valid positions (exclude initial window_len)
-        valid_target_mask = valid_mask[:, window_len:]  # [batch_size, max_length - window_len]
-        pred_seq = pred_y_norm_batch[:, window_len:]  # [batch_size, max_length - window_len]
-        target_seq = y_norm_batch[:, window_len:]  # [batch_size, max_length - window_len]
-        
-        # Calculate loss only on valid positions
-        valid_target_mask_float = valid_target_mask.float()
-        squared_diff = (pred_seq - target_seq) ** 2
-        loss_V = (squared_diff * valid_target_mask_float).sum()
-        num_valid = valid_target_mask.sum().item()
-        
-        if num_valid > 0:
-            all_losses.append(loss_V)
-            all_num_valid += num_valid
-            all_sum_sq_norm += (squared_diff * valid_target_mask_float).sum().item()
-            all_y_stds.extend([prof["y_std"] for prof in sub_batch_profiles])
-        
-        # Clear memory
-        del features_batch, y_norm_batch, valid_mask, pred_y_norm_batch
+    for i, p in enumerate(profile_data):
+        valid_len = p["total_steps"]
+        features_batch[i, :valid_len] = p["features"]
+        y_norm_batch[i, :valid_len] = p["y_norm"]
+        pred_y_norm_batch[i, :valid_len] = p["y_norm"]  # Initialize with true values
+        valid_mask[i, :valid_len] = True
+        y_std_list.append(p["prepared"]["Y_std"])
     
-    if not all_losses:
-        dummy_loss = torch.tensor(0.0, device=device, requires_grad=True)
-        return dummy_loss, {"num_windows": 0, "rmse_mV": float("nan")}
+    # Find max valid length
+    valid_lengths = valid_mask.sum(dim=1)  # [batch_size]
+    max_valid_length = valid_lengths.max().item()
     
-    # Aggregate loss
-    total_loss = sum(all_losses) / all_num_valid if all_num_valid > 0 else sum(all_losses)
+    if max_valid_length <= 1:
+        return {"num_steps": 0, "rmse_mV": float("nan"), "total_loss": 0.0}
+    
+    # Initialize hidden states (will be set on first forward pass)
+    gru1_hidden = None
+    gru2_hidden = None
+    
+    # TBPTT: Process in chunks
+    chunk_losses = []
+    total_valid_steps = 0
+    
+    # Process from k=0 to k=max_valid_length-2 (since target is k+1)
+    # We can predict k+1 for k in range(0, max_valid_length-1)
+    for chunk_start in range(0, max_valid_length - 1, tbptt_length):
+        chunk_end = min(chunk_start + tbptt_length, max_valid_length - 1)
+        chunk_losses_timestep = []
+        
+        # Detach hidden state at chunk start to break computation graph
+        if gru1_hidden is not None:
+            gru1_hidden = gru1_hidden.detach()
+            gru2_hidden = gru2_hidden.detach()
+        
+        # Forward pass for this chunk
+        for k in range(chunk_start, chunk_end):
+            # Check which profiles are valid at this timestep and have next timestep
+            valid_at_k = (k < valid_lengths) & ((k + 1) < valid_lengths)
+            if not valid_at_k.any():
+                continue
+            
+            # Get input at timestep k: [batch_size, 1, 6]
+            # x(k) = [V_spme_norm(k), ocv(k), SOC(k), I(k), T(k), Y(k)]
+            input_k = features_batch[:, k:k+1, :].clone()  # [batch_size, 1, 6]
+            
+            # Scheduled sampling: use true value or predicted value based on ratio
+            if k > 0 and teacher_forcing_ratio < 1.0:
+                use_true = torch.rand(batch_size_actual, device=device) < teacher_forcing_ratio
+                input_k[:, 0, 5] = torch.where(
+                    use_true,
+                    y_norm_batch[:, k],  # True value
+                    pred_y_norm_batch[:, k]  # Predicted value
+                )
+            else:
+                # k=0 or pure TF: always use true value
+                input_k[:, 0, 5] = y_norm_batch[:, k]
+            
+            # Forward pass with continuing hidden state
+            if gru1_hidden is None:
+                preds_seq, (gru1_hidden_new, gru2_hidden_new) = model(input_k, hidden=None)
+                gru1_hidden = gru1_hidden_new
+                gru2_hidden = gru2_hidden_new
+            else:
+                preds_seq, (gru1_hidden_new, gru2_hidden_new) = model(input_k, hidden=(gru1_hidden, gru2_hidden))
+                # Update hidden state only for valid profiles
+                valid_mask_hidden = valid_at_k.float().unsqueeze(0).unsqueeze(-1)
+                gru1_hidden = gru1_hidden * (1 - valid_mask_hidden) + gru1_hidden_new * valid_mask_hidden
+                gru2_hidden = gru2_hidden * (1 - valid_mask_hidden) + gru2_hidden_new * valid_mask_hidden
+            
+            # Get prediction: delta_Vcorr(k+1)
+            pred_delta = preds_seq[:, 0, 0]  # [batch_size]
+            
+            # Update predicted Y(k+1) for next timestep (for scheduled sampling)
+            pred_y_norm_batch[:, k + 1] = torch.where(
+                valid_at_k,
+                pred_y_norm_batch[:, k] + pred_delta.detach(),  # Y_pred(k+1) = Y_pred(k) + delta_pred
+                pred_y_norm_batch[:, k + 1]
+            )
+            
+            # Target: Y(k+1) - Y(k) = delta_Y(k+1)
+            target_delta = y_norm_batch[:, k + 1] - y_norm_batch[:, k]  # [batch_size]
+            
+            # Calculate loss
+            loss_per_profile = (pred_delta - target_delta) ** 2
+            valid_loss = loss_per_profile * valid_at_k.float()
+            timestep_loss = valid_loss.sum() / max(valid_at_k.sum().item(), 1)
+            chunk_losses_timestep.append(timestep_loss)
+            total_valid_steps += valid_at_k.sum().item()
+        
+        # Backward pass for entire chunk
+        if chunk_losses_timestep:
+            chunk_loss = torch.stack(chunk_losses_timestep).mean()
+            
+            # Only do backward pass if optimizer is provided (training mode)
+            if optimizer is not None:
+                optimizer.zero_grad()
+                chunk_loss.backward()
+                
+                # Gradient clipping
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                
+                # Detach hidden state after backward
+                if gru1_hidden is not None:
+                    gru1_hidden = gru1_hidden.detach()
+                    gru2_hidden = gru2_hidden.detach()
+            
+            # Always append loss for RMSE calculation (both training and validation)
+            chunk_losses.append(chunk_loss.item())
     
     # Calculate RMSE
-    avg_y_std = np.mean(all_y_stds) if all_y_stds else 1.0
-    rmse_norm = math.sqrt(all_sum_sq_norm / all_num_valid) if all_num_valid > 0 else float("nan")
-    rmse_mV = rmse_norm * avg_y_std * 1000
+    total_loss = sum(chunk_losses) if chunk_losses else 0.0
     
-    stats = {
-        "num_windows": all_num_valid,
+    # For RMSE calculation, we need to reconstruct predictions
+    # This is approximate - for exact RMSE, we'd need to run inference
+    if total_valid_steps > 0:
+        avg_loss = total_loss / len(chunk_losses) if chunk_losses else 0.0
+        rmse_norm = math.sqrt(avg_loss)
+        avg_y_std = float(np.mean(y_std_list))
+        rmse_mV = rmse_norm * avg_y_std * 1000
+    else:
+        rmse_mV = float("nan")
+    
+    return {
+        "num_steps": total_valid_steps,
         "rmse_mV": rmse_mV,
+        "total_loss": total_loss,
     }
-    
-    return total_loss, stats
 
 
-def train_battery_gru_tf(
-    profile_list: Sequence[Dict[str, Any]],
-    num_epochs: int,
-    lr: float,
-    device: Union[str, torch.device],
-    verbose: bool = True,
-    pretrained_model_path: Optional[str] = None,
-    window_len: int = 20,
-    predict_delta: bool = True,
-    shuffle_profiles: bool = True,
-    early_stop_patience: int = 10,
+def train_gru_tf(
+    train_dict_list: Sequence[Dict[str, Any]],
+    val_dict_list: Optional[Sequence[Dict[str, Any]]] = None,
+    num_epochs: int = 1000,
+    lr: float = 5e-4,
+    device: Union[str, torch.device] = "cpu",
     early_stop_window: int = 20,
-    early_stop_delta_mV: float = 0.005,
-    val_profile_list: Optional[Sequence[Dict[str, Any]]] = None,
-    ar_val_interval: Optional[int] = None,
-    hidden_size: int = 6,
-    num_layers: int = 1,
-    training_batch_size: Optional[int] = None,
-) -> Tuple[BatteryGRUWrapperTF, Dict[str, Dict[str, Optional[float]]]]:
+    verbose: bool = True,
+    gru1_hidden: int = 0,
+    gru2_hidden: int = 96,
+    dense1_hidden: int = 32,
+    dense2_hidden: int = 12,
+    tbptt_length: int = 200,
+    p_final: float = 1.0,
+) -> Tuple[BatteryGRUWrapperTF, Dict[str, Any]]:
     """
-    Train GRU with teacher forcing.
-    Teacher forcing: window_len만큼의 정답값을 사용해서 다음 타임스텝 하나만 예측.
-    모든 프로파일을 배치로 처리하여 GPU 효율적으로 계산.
-    """
+    Train GRU with teacher forcing and TBPTT.
     
+    Args:
+        train_dict_list: List of training profiles (dicts)
+        val_dict_list: Optional list of validation profiles
+        num_epochs: Number of training epochs
+        lr: Learning rate
+        device: Device to use
+        early_stop_window: Window size for early stopping
+        verbose: Print training progress
+        gru1_hidden: Bidirectional GRU hidden size (0 to skip)
+        gru2_hidden: Unidirectional GRU hidden size (0 to skip)
+        dense1_hidden: First dense layer hidden size (0 to skip)
+        dense2_hidden: Second dense layer hidden size (0 to skip)
+        tbptt_length: TBPTT chunk length
+        p_final: Final teacher forcing ratio for exponential scheduled sampling (1.0 = pure TF)
+    
+    Returns:
+        Trained model and training history
+    """
     device = torch.device(device)
     
-    # GPU 메모리 정리 (트레이닝 시작 전)
-    if device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        if verbose:
-            allocated = torch.cuda.memory_allocated(device) / 1024**3
-            reserved = torch.cuda.memory_reserved(device) / 1024**3
-            print(f"[GPU Memory] Cleared. Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
+    # Initialize model
+    model = BatteryGRUWrapperTF(
+        input_size=6,
+        gru1_hidden=gru1_hidden,
+        gru2_hidden=gru2_hidden,
+        dense1_hidden=dense1_hidden,
+        dense2_hidden=dense2_hidden,
+        device=device,
+    ).to(device)
     
-    model = BatteryGRUWrapperTF(input_size=6, hidden_size=hidden_size, num_layers=num_layers, device=device).to(device)
-    
-    if pretrained_model_path is not None:
-        try:
-            checkpoint = torch.load(pretrained_model_path, map_location=device, weights_only=False)
-            state = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
-            model.load_state_dict(state)
-            if verbose:
-                print(f"Loaded pretrained GRU weights from {pretrained_model_path}")
-        except Exception as exc:
-            print(f"⚠️  Could not load pretrained model: {exc}")
-
-    if verbose:
-        print("\n" + "=" * 70)
-        print("GRU Teacher Forcing Training Configuration")
-        print("=" * 70)
-        print(f"Architecture : GRU (input=6, hidden={hidden_size}, layers={num_layers})")
-        print(f"Head         : Linear({hidden_size} -> 1)")
-        print(f"Device       : {device}")
-        print(f"Epochs       : {num_epochs}")
-        print(f"Learning rate: {lr}")
-        print(f"Window len   : {window_len}")
-        print(f"Predict delta: {predict_delta}")
-        print(f"Train profiles: {len(profile_list)}")
-        print(f"Val profiles  : {len(val_profile_list) if val_profile_list else 0}")
-        print(f"Early-stop    : patience={early_stop_patience}, window={early_stop_window}, Δ={early_stop_delta_mV} mV")
-        print("=" * 70 + "\n")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, eps=1e-8, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, eps=1e-8, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=10, threshold=1e-3, threshold_mode="rel"
     )
-    criterion = nn.MSELoss()
 
-    history: Dict[str, Dict[str, Optional[float]]] = {"best": {}}
+    history: Dict[str, Any] = {
+        "best": {},
+        "epochs": [],
+        "config": {
+            "num_epochs": num_epochs,
+            "lr": lr,
+            "device": str(device),
+            "early_stop_window": early_stop_window,
+            "gru1_hidden": gru1_hidden,
+            "gru2_hidden": gru2_hidden,
+            "dense1_hidden": dense1_hidden,
+            "dense2_hidden": dense2_hidden,
+            "tbptt_length": tbptt_length,
+            "p_final": p_final,
+            "architecture_config": model.architecture_config,
+        }
+    }
+    
+    # Track best models for different criteria
+    best_models: Dict[str, Dict[str, Any]] = {
+        "60s": {"epoch": -1, "early_rmse": float("inf"), "rest_rmse": float("inf"), "state_dict": None},
+        "120s": {"epoch": -1, "early_rmse": float("inf"), "rest_rmse": float("inf"), "state_dict": None},
+        "300s": {"epoch": -1, "early_rmse": float("inf"), "rest_rmse": float("inf"), "state_dict": None},
+        "1200s": {"epoch": -1, "early_rmse": float("inf"), "rest_rmse": float("inf"), "state_dict": None},
+        "overall": {"epoch": -1, "rmse": float("inf"), "state_dict": None},
+    }
     best_rmse = float("inf")
     best_rmse_mV = float("inf")
     best_state = None
     best_epoch = -1
     epochs_since_improve = 0
     rmse_window = deque(maxlen=early_stop_window)
-    use_validation = val_profile_list is not None and len(val_profile_list) > 0
+    use_validation = val_dict_list is not None and len(val_dict_list) > 0
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print("GRU Teacher Forcing Training Configuration")
+        print("=" * 70)
+        print(f"Architecture: GRU1(bidir={gru1_hidden}) → GRU2({gru2_hidden}) → Dense1({dense1_hidden}) → Dense2({dense2_hidden})")
+        print(f"Device       : {device}")
+        print(f"Epochs       : {num_epochs}")
+        print(f"Learning rate: {lr}")
+        print(f"TBPTT length : {tbptt_length}")
+        print(f"Train profiles: {len(train_dict_list)}")
+        print(f"Val profiles  : {len(val_dict_list) if val_dict_list else 0}")
+        print(f"Early-stop    : window={early_stop_window}")
+        print("=" * 70 + "\n")
+
+    # Calculate exponential scheduled sampling decay factor
+    gamma = p_final ** (1.0 / num_epochs) if p_final > 0 else 0.0
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
         model.train()
         
-        # GPU 메모리 정리 (각 epoch 시작 전)
-        if device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Calculate teacher forcing ratio for this epoch (exponential decay)
+        teacher_forcing_ratio = gamma ** epoch if p_final < 1.0 else 1.0
         
-        if shuffle_profiles:
-            profile_list_shuffled = list(profile_list)
-            random.shuffle(profile_list_shuffled)
-        else:
-            profile_list_shuffled = list(profile_list)
-
-        # Process all profiles in batch (GPU efficient)
-        optimizer.zero_grad()
-        loss_tensor, stats = _batch_teacher_forcing_train_pass(
+        if verbose:
+            print(f"  Teacher forcing ratio: {teacher_forcing_ratio:.4f} ({teacher_forcing_ratio*100:.2f}% true, {((1-teacher_forcing_ratio)*100):.2f}% predicted)")
+        
+        # Shuffle training data
+        train_list_shuffled = list(train_dict_list)
+        random.shuffle(train_list_shuffled)
+        
+        # Training pass (optimizer.zero_grad() and optimizer.step() are called inside TBPTT chunks)
+        train_stats = _train_pass_tbptt_tf(
             model=model,
-            profile_list=profile_list_shuffled,
-            window_len=window_len,
-            predict_delta=predict_delta,
+            profile_list=train_list_shuffled,
             device=device,
-            training_batch_size=training_batch_size,  # Use provided batch_size
+            tbptt_length=tbptt_length,
+            verbose=verbose and epoch == 0,
+            optimizer=optimizer,
+            teacher_forcing_ratio=teacher_forcing_ratio,
         )
         
-        if stats["num_windows"] == 0:
-            if verbose:
-                print("No valid training windows for this epoch.")
-            break
+        train_rmse_mV = train_stats["rmse_mV"]
+        train_loss = train_stats["total_loss"]
         
-        loss_tensor.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)
-        optimizer.step()
-
-        epoch_loss = loss_tensor.item()
-        train_rmse_mV = stats["rmse_mV"]
-
-        val_loss = None
+        # Validation
         val_rmse_mV = None
-        val_rmse_norm = None
-
+        val_loss = None
+        val_ar_rmse_mV = None  # Auto-regressive RMSE
         if use_validation:
-            val_metrics = _evaluate_gru_profiles_tf(
+            model.eval()
+            with torch.no_grad():
+                # Teacher forcing RMSE (for comparison)
+                val_stats = _train_pass_tbptt_tf(
                 model=model,
-                profile_list=val_profile_list or [],
-                window_len=window_len,
-                predict_delta=predict_delta,
+                    profile_list=val_dict_list or [],
+                device=device,
+                    tbptt_length=tbptt_length,
+                    verbose=False,
+                    teacher_forcing_ratio=1.0,  # Validation: always use true values
+                )
+                val_rmse_mV = val_stats["rmse_mV"]
+                val_loss = val_stats["total_loss"]
+                
+                # Auto-regressive RMSE (actual inference scenario)
+                val_ar_stats = _calculate_autoregressive_rmse_tf(
+                model=model,
+                    profile_list=val_dict_list or [],
                 device=device,
             )
-            val_rmse_mV = val_metrics["avg_rmse_vcorr_mV"]
-            val_rmse_norm = val_metrics["avg_rmse_norm"]
-            val_loss = val_rmse_norm**2 if val_rmse_norm == val_rmse_norm else None
+                val_ar_rmse_mV = val_ar_stats["avg_rmse_mV"]
+                val_ar_time_segmented = val_ar_stats.get("time_segmented_rmse", {})
+                
+                # Update best models based on criteria
+                if val_ar_time_segmented:
+                    rest_rmse = val_ar_time_segmented.get("rest_after_1730s", float("inf"))
+                    overall_rmse = val_ar_time_segmented.get("all", float("inf"))
+                    
+                    # Check each early segment
+                    for seg_name in ["60s", "120s", "300s", "1200s"]:
+                        early_rmse = val_ar_time_segmented.get(seg_name, float("inf"))
+                        if early_rmse == float("inf") or rest_rmse == float("inf"):
+                            continue
+                        
+                        current_best = best_models[seg_name]
+                        threshold = current_best["early_rmse"] * 1.2  # 20% threshold
+                        
+                        # First epoch or (within threshold and better rest RMSE)
+                        if (current_best["epoch"] == -1) or (early_rmse <= threshold and rest_rmse < current_best["rest_rmse"]):
+                            best_models[seg_name] = {
+                                "epoch": epoch + 1,
+                                "early_rmse": early_rmse,
+                                "rest_rmse": rest_rmse,
+                                "state_dict": copy.deepcopy(model.state_dict()),
+                            }
+                    
+                    # Overall best
+                    if overall_rmse < best_models["overall"]["rmse"]:
+                        best_models["overall"] = {
+                            "epoch": epoch + 1,
+                            "rmse": overall_rmse,
+                            "state_dict": copy.deepcopy(model.state_dict()),
+                        }
 
-        monitor_loss = val_loss if use_validation and val_loss is not None else epoch_loss
+        # Learning rate scheduling
+        monitor_loss = val_loss if use_validation and val_loss is not None else train_loss
         scheduler.step(monitor_loss)
 
-        monitor_rmse = (
-            val_rmse_norm if use_validation and val_rmse_norm is not None else math.sqrt(epoch_loss)
-        )
-        monitor_rmse_mV = (
-            val_rmse_mV if use_validation and val_rmse_mV is not None else train_rmse_mV
-        )
-
-        # Update best model if improved (same as ResNet: any improvement is accepted)
-        # Early stopping uses rmse_window, not this condition
-        if monitor_rmse < best_rmse:
-            best_rmse = monitor_rmse
+        # Update best model (use auto-regressive RMSE for validation if available)
+        if use_validation and val_ar_rmse_mV is not None:
+            monitor_rmse_mV = val_ar_rmse_mV  # Use auto-regressive RMSE
+        elif use_validation and val_rmse_mV is not None:
+            monitor_rmse_mV = val_rmse_mV  # Fallback to teacher forcing RMSE
+        else:
+            monitor_rmse_mV = train_rmse_mV
+        
+        if monitor_rmse_mV < best_rmse_mV and monitor_rmse_mV == monitor_rmse_mV:  # Check for NaN
             best_rmse_mV = monitor_rmse_mV
+            best_rmse = math.sqrt(monitor_loss) if monitor_loss > 0 else float("inf")
             best_state = copy.deepcopy(model.state_dict())
             best_epoch = epoch + 1
             epochs_since_improve = 0
             history["best"] = {
                 "epoch": best_epoch,
-                "train_loss": epoch_loss,
+                "train_loss": train_loss,
                 "train_rmse_mV": train_rmse_mV,
                 "val_loss": val_loss,
                 "val_rmse_mV": val_rmse_mV,
+                "val_ar_rmse_mV": val_ar_rmse_mV,  # Auto-regressive RMSE
             }
             if verbose:
                 print(f"✅ Best RMSE: {monitor_rmse_mV:.2f} mV at epoch {epoch + 1}")
@@ -490,376 +762,464 @@ def train_battery_gru_tf(
 
         epoch_elapsed_time = time.time() - epoch_start_time
 
+        # Store epoch information
+        epoch_info = {
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "train_rmse_mV": train_rmse_mV,
+            "val_loss": val_loss,
+            "val_rmse_mV": val_rmse_mV,
+            "val_ar_rmse_mV": val_ar_rmse_mV,
+            "val_ar_time_segmented": val_ar_time_segmented if use_validation else {},
+            "lr": optimizer.param_groups[0]['lr'],
+            "time_elapsed": epoch_elapsed_time,
+            "teacher_forcing_ratio": teacher_forcing_ratio,
+        }
+        history["epochs"].append(epoch_info)
+
         if verbose:
             msg = (
                 f"Epoch {epoch + 1:3d}/{num_epochs} | "
                 f"Time: {epoch_elapsed_time:.1f}s | "
                 f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
-                f"Loss: {epoch_loss:.4e} | Train RMSE: {train_rmse_mV:.2f} mV"
+                f"Loss: {train_loss:.4e} | Train RMSE: {train_rmse_mV:.2f} mV"
             )
-            if use_validation and val_loss is not None:
-                msg += f" | Val Loss: {val_loss:.4e} | Val RMSE: {val_rmse_mV:.2f} mV"
+            if use_validation and val_rmse_mV is not None:
+                msg += f" | Val RMSE (TF): {val_rmse_mV:.2f} mV"
+            if use_validation and val_ar_rmse_mV is not None:
+                msg += f" | Val RMSE (AR): {val_ar_rmse_mV:.2f} mV"
             print(msg)
 
-        if early_stop_patience and epochs_since_improve >= early_stop_patience:
-            if verbose:
-                print(f"Early stopping triggered (no improvement for {early_stop_patience} epochs).")
-            break
+            # Print time-segmented validation RMSE
+            if use_validation and val_ar_time_segmented:
+                time_segments = ["30s", "60s", "120s", "180s", "300s", "600s", "900s", "1200s", "all"]
+                seg_strs = [f"{seg}: {val_ar_time_segmented.get(seg, float('nan')):.2f}mV" for seg in time_segments if seg in val_ar_time_segmented]
+                if seg_strs:
+                    print(f"  Val RMSE (AR) by time: {' | '.join(seg_strs)}")
 
+        # Early stopping
         if early_stop_window > 0 and train_rmse_mV == train_rmse_mV:
             rmse_window.append(train_rmse_mV)
             if (
                 rmse_window.maxlen == len(rmse_window)
-                and (max(rmse_window) - min(rmse_window)) <= early_stop_delta_mV
+                and (max(rmse_window) - min(rmse_window)) <= 0.005
             ):
                 if verbose:
-                    print(
-                        f"Early stopping triggered (ΔRMSE <= {early_stop_delta_mV:.3f} mV over "
-                        f"{early_stop_window} epochs)."
-                    )
+                    print(f"Early stopping triggered (ΔRMSE <= 0.005 mV over {early_stop_window} epochs).")
                 break
 
+    # Load best model
     if best_state is not None:
         model.load_state_dict(best_state)
 
     if best_epoch == -1:
-        best_epoch = history["best"].get("epoch", 0) if history["best"] else 0
+        best_epoch = history["best"].get("epoch", num_epochs) if history["best"] else num_epochs
 
-    checkpoint = {
-        "model_state_dict": best_state if best_state is not None else model.state_dict(),
-        "training_info": {
-            "best_metric": "val_rmse_mV" if use_validation else "train_rmse_mV",
+    # Save checkpoints
+    base_info = {
             "best_rmse_mV": best_rmse_mV,
             "best_rmse_norm": best_rmse,
             "best_epoch": best_epoch,
             "total_epochs": num_epochs,
             "lr": lr,
-            "window_len": window_len,
-            "predict_delta": predict_delta,
-            "hidden_size": hidden_size,
-            "num_layers": num_layers,
-            "early_stop_patience": early_stop_patience,
-            "early_stop_window": early_stop_window,
-            "early_stop_delta_mV": early_stop_delta_mV,
-            "use_validation": use_validation,
-        },
-        "network_architecture": str(model),
+        "tbptt_length": tbptt_length,
+        "architecture_config": model.architecture_config,
     }
+    
+    # Save best model (overall)
     best_model_path = f"best_model_gru_tf_rmse{best_rmse_mV:.2f}mV.pth"
+    checkpoint = {
+        "model_state_dict": best_state if best_state is not None else model.state_dict(),
+        "training_info": {**base_info},
+        "history": history,
+    }
     torch.save(checkpoint, best_model_path)
     if verbose:
         print(f"Best model saved to: {best_model_path}")
+    
+    # Save criteria-based best models
+    saved_paths = [best_model_path]
+    for seg_name, best_info in best_models.items():
+        if best_info["epoch"] != -1 and best_info["state_dict"] is not None:
+            if seg_name == "overall":
+                continue  # Already saved above
+            path = f"best_model_gru_tf_{seg_name}_early{best_info['early_rmse']:.2f}mV_rest{best_info['rest_rmse']:.2f}mV.pth"
+            checkpoint = {
+                "model_state_dict": best_info["state_dict"],
+                "training_info": {
+                    **base_info,
+                    "criteria": seg_name,
+                    "early_rmse_mV": best_info["early_rmse"],
+                    "rest_rmse_mV": best_info["rest_rmse"],
+                },
+                "history": history,
+            }
+            torch.save(checkpoint, path)
+            saved_paths.append(path)
+            if verbose:
+                print(f"  {seg_name} best (epoch {best_info['epoch']}): {path}")
 
     history["best"]["checkpoint_path"] = best_model_path
     history["checkpoint_path"] = best_model_path
+    history["best"]["criteria_checkpoints"] = {k: f"best_model_gru_tf_{k}_..." for k in best_models.keys() if k != "overall" and best_models[k]["epoch"] != -1}
 
     return model, history
 
 
-def _evaluate_gru_profiles_tf(
-    model: BatteryGRUWrapperTF,
-    profile_list: Sequence[Dict[str, Any]],
-    window_len: int,
-    predict_delta: bool,
-    device: torch.device,
-) -> Dict[str, float]:
-    """
-    Evaluate profiles with teacher forcing (batch processing, same as training).
-    All profiles are processed simultaneously on GPU.
-    """
-    if not profile_list:
-        return {
-            "avg_rmse_vcorr_mV": float("nan"),
-            "avg_rmse_norm": float("nan"),
-            "avg_Y_std": float("nan"),
-        }
-
-    # Prepare all profiles
-    profile_data = []
-    for profile in profile_list:
-        feature_tensor, y_norm, total_steps, y_mean, y_std = _prepare_profile_tensors_tf(profile, device)
-        if total_steps <= window_len:
-            continue
-        profile_data.append({
-            "features": feature_tensor,  # [T, 6]
-            "y_norm": y_norm,  # [T]
-            "total_steps": total_steps,
-            "y_mean": y_mean,
-            "y_std": y_std,
-        })
-    
-    if not profile_data:
-        return {
-            "avg_rmse_vcorr_mV": float("nan"),
-            "avg_rmse_norm": float("nan"),
-            "avg_Y_std": float("nan"),
-        }
-    
-    # OOM 방지: validation도 sub-batch로 나눠서 처리 (training과 동일)
-    # ResNet처럼 각 타임스텝마다 독립적으로 처리하므로 큰 배치 사용 가능
-    sub_batch_size = min(128, len(profile_data))
-    
-    all_rmse_norm: List[float] = []
-    all_rmse_vcorr: List[float] = []
-    all_y_stds: List[float] = []
-    
-    model.eval()
-    with torch.no_grad():
-        # Process profiles in sub-batches
-        for sub_batch_start in range(0, len(profile_data), sub_batch_size):
-            sub_batch_end = min(sub_batch_start + sub_batch_size, len(profile_data))
-            sub_batch_profiles = profile_data[sub_batch_start:sub_batch_end]
-            
-            # Prepare batch tensors with padding
-            batch_size = len(sub_batch_profiles)
-            max_length = max(prof["total_steps"] for prof in sub_batch_profiles)
-            
-            features_batch = torch.zeros(batch_size, max_length, 6, dtype=torch.float32, device=device)
-            y_norm_batch = torch.zeros(batch_size, max_length, dtype=torch.float32, device=device)
-            valid_mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=device)
-            
-            for i, prof in enumerate(sub_batch_profiles):
-                valid_len = prof["total_steps"]
-                features_batch[i, :valid_len] = prof["features"]
-                y_norm_batch[i, :valid_len] = prof["y_norm"]
-                valid_mask[i, :valid_len] = True
-            
-            # Perform batch autoregressive rollout with teacher forcing (same as training)
-            pred_y_norm_batch = _gru_autoregressive_rollout_train_batch_tf(
-                model=model,
-                features_batch=features_batch,
-                y_norm_batch=y_norm_batch,
-                valid_mask=valid_mask,
-                window_len=window_len,
-                predict_delta=predict_delta,
-            )  # Shape: [batch_size, max_length]
-            
-            # Calculate loss on valid positions (exclude initial window_len)
-            valid_target_mask = valid_mask[:, window_len:]  # [batch_size, max_length - window_len]
-            pred_seq = pred_y_norm_batch[:, window_len:]  # [batch_size, max_length - window_len]
-            target_seq = y_norm_batch[:, window_len:]  # [batch_size, max_length - window_len]
-            
-            # Calculate RMSE for each profile
-            for i, prof in enumerate(sub_batch_profiles):
-                valid_len = prof["total_steps"]
-                valid_target_len = valid_len - window_len
-                if valid_target_len <= 0:
-                    continue
-                
-                pred_valid = pred_seq[i, :valid_target_len].cpu().numpy()
-                target_valid = target_seq[i, :valid_target_len].cpu().numpy()
-                
-                rmse_norm = float(np.sqrt(np.mean((pred_valid - target_valid) ** 2)))
-                rmse_vcorr = rmse_norm * prof["y_std"] * 1000
-                
-                all_rmse_norm.append(rmse_norm)
-                all_rmse_vcorr.append(rmse_vcorr)
-                all_y_stds.append(prof["y_std"])
-    
-    avg_rmse_norm = float(np.nanmean(all_rmse_norm)) if all_rmse_norm else float("nan")
-    avg_rmse_vcorr = float(np.nanmean(all_rmse_vcorr)) if all_rmse_vcorr else float("nan")
-    avg_y_std = float(np.nanmean(all_y_stds)) if all_y_stds else float("nan")
-    
-    return {
-        "avg_rmse_vcorr_mV": avg_rmse_vcorr,
-        "avg_rmse_norm": avg_rmse_norm,
-        "avg_Y_std": avg_y_std,
-    }
-
-
-def train_gru_benchmark_tf(
-    train_dict_list: Sequence[Dict[str, Any]],
-    val_dict_list: Optional[Sequence[Dict[str, Any]]] = None,
-    num_epochs: int = 1000,
-    lr: float = 5e-4,
-    device: Union[str, torch.device] = "cpu",
-    pretrained_model_path: Optional[Union[str, Path]] = None,
-    window_len: int = 20,
-    batch_size: Optional[int] = None,
-    predict_delta: bool = True,
-    ar_val_interval: Optional[int] = None,
-    verbose: bool = True,
-    hidden_size: int = 6,
-    num_layers: int = 1,
-) -> Dict[str, Any]:
-    """
-    batch_size: Number of profiles to use per training step (None = use all, default 128)
-    """
-    model, history = train_battery_gru_tf(
-        profile_list=train_dict_list,
-        num_epochs=num_epochs,
-        lr=lr,
-        device=device,
-        verbose=verbose,
-        pretrained_model_path=pretrained_model_path,
-        window_len=window_len,
-        predict_delta=predict_delta,
-        shuffle_profiles=True,
-        early_stop_patience=10,
-        early_stop_window=20,
-        early_stop_delta_mV=0.005,
-        val_profile_list=val_dict_list,
-        ar_val_interval=ar_val_interval,
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        training_batch_size=batch_size,  # Pass batch_size to control sub_batch_size
-    )
-    return {"model": model, "history": history}
-
-
-def run_gru_benchmark_inference_tf(
-    dict_list: Sequence[Dict[str, Any]],
+def load_model_from_checkpoint(
     checkpoint_path: Union[str, Path],
     device: Union[str, torch.device] = "cpu",
-    window_len: Optional[int] = None,
-    predict_delta: Optional[bool] = None,
-    hidden_size: Optional[int] = None,
-    num_layers: Optional[int] = None,
-    verbose: bool = True,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> Tuple[BatteryGRUWrapperTF, Dict[str, Any]]:
     """
-    Run inference using BatteryGRUWrapperTF model (teacher forcing trained).
-    Auto-regressive rollout over a list of profiles.
-    """
-    device = torch.device(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    training_info = checkpoint.get("training_info", {})
-
-    inferred_window = training_info.get("window_len", window_len)
-    if inferred_window is None:
-        raise ValueError("window_len must be provided when checkpoint lacks metadata.")
-    inferred_predict_delta = training_info.get("predict_delta", predict_delta)
-    if inferred_predict_delta is None:
-        inferred_predict_delta = True
+    Load model from checkpoint file.
     
-    # Get model architecture from checkpoint
-    inferred_hidden_size = training_info.get("hidden_size", hidden_size)
-    if inferred_hidden_size is None:
-        inferred_hidden_size = 32  # Default
-    inferred_num_layers = training_info.get("num_layers", num_layers)
-    if inferred_num_layers is None:
-        inferred_num_layers = 1  # Default
-
+    Args:
+        checkpoint_path: Path to checkpoint file (.pth)
+        device: Device to load model on
+    
+    Returns:
+        model: Loaded BatteryGRUWrapperTF model
+        training_info: Training information from checkpoint
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    training_info = checkpoint.get("training_info", {})
+    architecture_config = training_info.get("architecture_config", {})
+    
+    # Create model with saved architecture
     model = BatteryGRUWrapperTF(
-        input_size=6,
-        hidden_size=inferred_hidden_size,
-        num_layers=inferred_num_layers,
-        device=device
-    ).to(device)
+        input_size=architecture_config.get("input_size", 6),
+        gru1_hidden=architecture_config.get("gru1_hidden", 0),
+        gru2_hidden=architecture_config.get("gru2_hidden", 96),
+        dense1_hidden=architecture_config.get("dense1_hidden", 32),
+        dense2_hidden=architecture_config.get("dense2_hidden", 12),
+        device=device,
+    )
+    
+    # Load state dict
     model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)  # Move model to device
     model.eval()
+    
+    return model, training_info
 
-    results: List[Dict[str, Any]] = []
-    rmse_vcorr_list: List[float] = []
-    rmse_vtotal_list: List[float] = []
+
+def inference_gru_tf(
+    model: BatteryGRUWrapperTF,
+    test_dict_list: Sequence[Dict[str, Any]],
+    device: Union[str, torch.device] = "cpu",
+    return_predictions: bool = True,
+) -> Dict[str, Any]:
+    """
+    Perform inference on test data using auto-regressive rollout.
+    
+    Args:
+        model: BatteryGRUWrapperTF model (should be in eval mode)
+        test_dict_list: List of test profiles (dict format)
+        device: Device to run inference on
+        return_predictions: If True, return predictions for each profile
+    
+    Returns:
+        Dictionary containing:
+            - avg_rmse_mV: Average RMSE across all profiles (mV)
+            - rmse_list: List of RMSE for each profile (mV)
+            - time_segmented_rmse: Dictionary of RMSE by time segments
+            - predictions: (optional) List of prediction dictionaries for each profile
+    """
+    model.eval()
+    device = torch.device(device)
+    
+    if not test_dict_list:
+        return {"avg_rmse_mV": float("nan"), "rmse_list": [], "time_segmented_rmse": {}}
+    
+    print(f"[inference_gru_tf] Input test_dict_list contains {len(test_dict_list)} profiles")
+    
+    rmse_list: List[float] = []
     y_std_list: List[float] = []
-
-    total_profiles = len(dict_list)
-    if verbose:
-        print(f"\n[GRU TF TEST] Loading checkpoint: {checkpoint_path}")
-        if training_info:
-            print("  --- Checkpoint Metadata ---")
-            for key in sorted(training_info.keys()):
-                print(f"  {key}: {training_info[key]}")
-        else:
-            print("  (no training_info metadata found)")
-        print(f"[GRU TF TEST] Model: hidden_size={inferred_hidden_size}, num_layers={inferred_num_layers}")
-        print(f"[GRU TF TEST] Total profiles to evaluate: {total_profiles}")
-        print("=" * 60)
-
-    for idx, profile in enumerate(dict_list):
-        feature_tensor, y_norm, total_steps, y_mean, y_std = _prepare_profile_tensors_tf(profile, device)
-        if total_steps <= inferred_window:
-            if verbose:
-                print(
-                    f"[GRU TF TEST] Skipping profile {idx} "
-                    f"(length {total_steps} <= window {inferred_window})"
-                )
-            continue
-
-        # Autoregressive rollout (inference: use predictions, not ground truth)
-        preds_norm = _gru_autoregressive_rollout_tf(
-            model=model,
-            feature_array=feature_tensor.cpu().numpy(),
-            initial_y=y_norm.cpu().numpy(),
-            window_len=inferred_window,
-            predict_delta=inferred_predict_delta,
-            device=device,
-        )
-
-        pred_vcorr = preds_norm * y_std + y_mean
-        target_vcorr = y_norm.cpu().numpy() * y_std + y_mean
+    pred_all: List[np.ndarray] = []
+    target_all: List[np.ndarray] = []
+    time_all: List[np.ndarray] = []
+    predictions_list: List[Dict[str, np.ndarray]] = []
+    
+    with torch.no_grad():
+        for profile_idx, profile in enumerate(test_dict_list):
+            print(f"[inference_gru_tf] Processing profile {profile_idx + 1}/{len(test_dict_list)}")
+            prepared, feature_tensor, y_norm = _prepare_profile_tensors_tf(profile, device)
+            total_steps = y_norm.shape[0]
+            
+            if total_steps <= 1:
+                print(f"  [inference_gru_tf] Profile {profile_idx + 1}: Skipped (total_steps <= 1)")
+                continue
+            
+            # Initialize predictions
+            pred_y_norm = y_norm.clone()  # Start with true value at k=0
+            features_autoreg = feature_tensor.clone()  # [T, 6]
+            
+            # Initialize hidden states
+            gru1_hidden = None
+            gru2_hidden = None
+            
+            # Auto-regressive rollout: k=0 to k=total_steps-2 (predict k+1)
+            for k in range(total_steps - 1):
+                # Get input at timestep k: [1, 1, 6]
+                input_k = features_autoreg[k:k+1, :].unsqueeze(0)  # [1, 1, 6]
+                # Use predicted value (auto-regressive)
+                input_k[0, 0, 5] = pred_y_norm[k]  # Y(k) = predicted value
+                
+                # Forward pass
+                if gru1_hidden is None:
+                    preds_seq, (gru1_hidden, gru2_hidden) = model(input_k, hidden=None)
+                else:
+                    preds_seq, (gru1_hidden, gru2_hidden) = model(input_k, hidden=(gru1_hidden, gru2_hidden))
+                
+                # Get prediction: delta_Vcorr(k+1)
+                pred_delta = preds_seq[0, 0, 0].item()
+                
+                # Update predicted Y(k+1)
+                pred_y_norm[k + 1] = pred_y_norm[k] + pred_delta
+                features_autoreg[k + 1, 5] = pred_y_norm[k + 1]
+            
+            # Calculate RMSE (exclude first timestep)
+            if total_steps > 1:
+                pred_valid = pred_y_norm[1:].cpu().numpy()
+                target_valid = y_norm[1:].cpu().numpy()
+                time_valid = np.array(prepared["time"][1:])  # Time array (exclude first timestep)
+                
+                # Denormalize predictions
+                y_std = prepared["Y_std"]
+                y_mean = prepared["Y_mean"]
+                pred_denorm = pred_valid * y_std + y_mean
+                target_denorm = target_valid * y_std + y_mean
+                
+                rmse_norm = float(np.sqrt(np.mean((pred_valid - target_valid) ** 2)))
+                rmse_mV = rmse_norm * y_std * 1000
+                
+                rmse_list.append(rmse_mV)
+                y_std_list.append(y_std)
+                
+                # Store for time-segmented RMSE calculation
+                pred_all.append(pred_valid)
+                target_all.append(target_valid)
+                time_all.append(time_valid)
+                
+                # Store predictions if requested
+                if return_predictions:
+                    predictions_list.append({
+                        "time": time_valid,
+                        "pred_norm": pred_valid,
+                        "target_norm": target_valid,
+                        "pred_denorm": pred_denorm,
+                        "target_denorm": target_denorm,
+                        "rmse_mV": rmse_mV,
+                    })
+    
+    avg_rmse_mV = float(np.nanmean(rmse_list)) if rmse_list else float("nan")
+    
+    # Calculate time-segmented RMSE
+    time_segments = [30, 60, 120, 180, 300, 600, 900, 1200, float("inf")]
+    time_segmented_rmse = {}
+    
+    if pred_all:
+        pred_flat = np.concatenate(pred_all)
+        target_flat = np.concatenate(target_all)
+        time_flat = np.concatenate(time_all)
         
-        # Get other profile data
-        prepared = prepare_profile_for_gru(profile)
-        v_spme = prepared["V_spme"]
-        v_meas = prepared.get("V_meas")
-        time_array = prepared["time"]
-        soc_array = prepared["SOC"]
+        for t_max in time_segments:
+            mask = time_flat <= t_max
+            if mask.any():
+                rmse_seg = float(np.sqrt(np.mean((pred_flat[mask] - target_flat[mask]) ** 2)))
+                avg_y_std = float(np.nanmean(y_std_list)) if y_std_list else 1.0
+                rmse_seg_mV = rmse_seg * avg_y_std * 1000
+                label = f"{int(t_max)}s" if t_max != float("inf") else "all"
+                time_segmented_rmse[label] = rmse_seg_mV
+        
+        # Calculate rest RMSE (after 1730s)
+        mask_rest = time_flat > 1730
+        if mask_rest.any():
+            rmse_rest = float(np.sqrt(np.mean((pred_flat[mask_rest] - target_flat[mask_rest]) ** 2)))
+            avg_y_std = float(np.nanmean(y_std_list)) if y_std_list else 1.0
+            rmse_rest_mV = rmse_rest * avg_y_std * 1000
+            time_segmented_rmse["rest_after_1730s"] = rmse_rest_mV
+    
+    result = {
+        "avg_rmse_mV": avg_rmse_mV,
+        "rmse_list": rmse_list,
+        "time_segmented_rmse": time_segmented_rmse,
+    }
+    
+    if return_predictions:
+        result["predictions"] = predictions_list
+    
+    return result
 
-        mask_valid = np.ones(total_steps, dtype=bool)
-        mask_valid[:inferred_window] = False
-        mask_valid &= np.isfinite(pred_vcorr) & np.isfinite(target_vcorr)
 
-        if np.any(mask_valid):
-            rmse_vcorr = float(
-                np.sqrt(np.mean((pred_vcorr[mask_valid] - target_vcorr[mask_valid]) ** 2)) * 1000
+def plot_inference_results(
+    results: Dict[str, Any],
+    test_dict_list: Sequence[Dict[str, Any]],
+    title_prefix: str = "GRU Inference Results",
+) -> go.Figure:
+    """
+    Plot inference results: V_meas vs (V_spme + V_corr_pred_denormalized).
+    
+    Args:
+        results: Results dictionary from inference_gru_tf
+        test_dict_list: Original test profiles (list of dict)
+        title_prefix: Prefix for plot titles
+    
+    Returns:
+        Plotly figure object
+    """
+    if "predictions" not in results or not results["predictions"]:
+        fig = go.Figure()
+        fig.update_layout(title="No predictions to plot")
+        return fig
+    
+    predictions = results["predictions"]
+    num_profiles = len(predictions)
+    
+    print(f"[plot_inference_results] Plotting {num_profiles} profiles from results")
+    print(f"[plot_inference_results] Input test_dict_list contains {len(test_dict_list)} profiles")
+    
+    # Two subplots per profile: V_meas vs V_spme+V_corr_pred, and Vcorr vs V_corr_pred_denorm
+    fig = make_subplots(
+        rows=num_profiles,
+        cols=2,
+        subplot_titles=[f"Profile {i+1} - V_meas vs V_spme+V_corr_pred" if j == 0 else f"Profile {i+1} - Vcorr vs V_corr_pred" 
+                        for i in range(num_profiles) for j in range(2)],
+        vertical_spacing=0.08,
+        horizontal_spacing=0.1,
+        shared_xaxes=True,
+    )
+    
+    for idx, (pred_dict, profile) in enumerate(zip(predictions, test_dict_list)):
+        print(f"[plot_inference_results] Plotting profile {idx + 1}/{num_profiles}")
+        row = idx + 1
+        time_data = np.array(pred_dict["time"])
+        
+        # Get V_meas from original profile (skip first timestep to match predictions)
+        v_meas = None
+        if "df" in profile:
+            df = profile["df"]
+            if "V_meas" in df.columns:
+                v_meas = df["V_meas"].values[1:]  # Skip first timestep to match predictions
+        elif "V_meas" in profile:
+            v_meas = np.array(profile["V_meas"])[1:]  # Skip first timestep
+        
+        # Get V_corr_pred_denormalized from predictions
+        v_corr_pred_denorm = np.array(pred_dict["pred_denorm"])
+        
+        # Get V_spme from original profile
+        v_spme = None
+        if "df" in profile:
+            df = profile["df"]
+            if "V_spme" in df.columns:
+                v_spme = df["V_spme"].values[1:]  # Skip first timestep
+        elif "V_spme" in profile:
+            v_spme = np.array(profile["V_spme"])[1:]  # Skip first timestep
+        
+        # Get Vcorr (true value) from original profile
+        vcorr = None
+        if "df" in profile:
+            df = profile["df"]
+            if "Vcorr" in df.columns:
+                vcorr = df["Vcorr"].values[1:]  # Skip first timestep
+        elif "Vcorr" in profile:
+            vcorr = np.array(profile["Vcorr"])[1:]  # Skip first timestep
+        
+        # Skip if essential data is missing
+        if v_meas is None or v_spme is None:
+            print(f"  [plot_inference_results] Profile {idx + 1}: Skipped (V_meas or V_spme not found)")
+            continue
+        
+        # Ensure same length for first subplot (V_meas vs V_spme+V_corr_pred)
+        min_len1 = min(len(time_data), len(v_meas), len(v_spme), len(v_corr_pred_denorm))
+        time_data1 = time_data[:min_len1]
+        v_meas_plot = v_meas[:min_len1]
+        v_spme_plot = v_spme[:min_len1]
+        v_corr_pred_denorm1 = v_corr_pred_denorm[:min_len1]
+        
+        # Calculate V_spme + V_corr_pred_denormalized
+        v_spme_corr = v_spme_plot + v_corr_pred_denorm1
+        
+        # Plot 1: V_meas vs V_spme + V_corr_pred (left column)
+        fig.add_trace(
+            go.Scatter(
+                x=time_data1,
+                y=v_meas_plot,
+                mode="lines",
+                name="V_meas" if idx == 0 else None,
+                line=dict(color="blue", width=1.5),
+                legendgroup="v_meas",
+                showlegend=(idx == 0),
+            ),
+            row=row,
+            col=1,
+        )
+        
+        fig.add_trace(
+            go.Scatter(
+                x=time_data1,
+                y=v_spme_corr,
+                mode="lines",
+                name="V_spme + V_corr_pred" if idx == 0 else None,
+                line=dict(color="red", width=1.5, dash="dash"),
+                legendgroup="v_spme_corr",
+                showlegend=(idx == 0),
+            ),
+            row=row,
+            col=1,
+        )
+        
+        # Plot 2: Vcorr vs V_corr_pred_denorm (right column)
+        if vcorr is not None:
+            min_len2 = min(len(time_data), len(vcorr), len(v_corr_pred_denorm))
+            time_data2 = time_data[:min_len2]
+            vcorr_plot = vcorr[:min_len2]
+            v_corr_pred_denorm2 = v_corr_pred_denorm[:min_len2]
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=time_data2,
+                    y=vcorr_plot,
+                    mode="lines",
+                    name="Vcorr (true)" if idx == 0 else None,
+                    line=dict(color="green", width=1.5),
+                    legendgroup="vcorr",
+                    showlegend=(idx == 0),
+                ),
+                row=row,
+                col=2,
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=time_data2,
+                    y=v_corr_pred_denorm2,
+                    mode="lines",
+                    name="V_corr_pred_denorm" if idx == 0 else None,
+                    line=dict(color="orange", width=1.5, dash="dash"),
+                    legendgroup="v_corr_pred_denorm",
+                    showlegend=(idx == 0),
+                ),
+                row=row,
+                col=2,
             )
         else:
-            rmse_vcorr = float("nan")
+            print(f"  [plot_inference_results] Profile {idx + 1}: Vcorr not found, skipping second subplot")
+        
+        # Update axes
+        if idx == 0:
+            fig.update_xaxes(title_text="Time (s)", row=row, col=1)
+            fig.update_xaxes(title_text="Time (s)", row=row, col=2)
+        fig.update_yaxes(title_text="Voltage (V)", row=row, col=1)
+        fig.update_yaxes(title_text="Vcorr (V)", row=row, col=2)
+    
+    avg_rmse = results.get("avg_rmse_mV", float("nan"))
+    fig.update_layout(
+        title=f"{title_prefix} | Total Profiles: {num_profiles} | Avg RMSE: {avg_rmse:.2f} mV",
+        height=300 * num_profiles,
+        width=1400,  # Wider to accommodate two columns
+        hovermode="x unified",
+    )
+    
+    return fig
 
-        if v_meas is not None and v_spme is not None:
-            vtotal_pred = v_spme + pred_vcorr
-            vtotal_target = v_meas
-            mask_vtotal = mask_valid & np.isfinite(vtotal_target)
-            if np.any(mask_vtotal):
-                rmse_vtotal = float(
-                    np.sqrt(np.mean((vtotal_pred[mask_vtotal] - vtotal_target[mask_vtotal]) ** 2)) * 1000
-                )
-            else:
-                rmse_vtotal = float("nan")
-        else:
-            rmse_vtotal = float("nan")
-
-        results.append(
-            {
-                "profile_idx": idx,
-                "time": time_array,
-                "SOC": soc_array,
-                "Vcorr_pred": pred_vcorr,
-                "Vcorr_target": target_vcorr,
-                "Vtotal_pred": vtotal_pred if v_meas is not None else None,
-                "Vtotal_target": v_meas,
-                "V_meas": v_meas,  # For plotting compatibility
-                "V_spme": v_spme,
-                "rmse_vcorr_mV": rmse_vcorr,
-                "rmse_vtotal_mV": rmse_vtotal,
-            }
-        )
-        rmse_vcorr_list.append(rmse_vcorr)
-        rmse_vtotal_list.append(rmse_vtotal)
-        y_std_list.append(y_std)
-
-        if verbose and (idx + 1) % 50 == 0:
-            print(f"[GRU TF TEST] Processed {idx + 1}/{total_profiles} profiles...")
-
-    avg_rmse_vcorr = float(np.nanmean(rmse_vcorr_list)) if rmse_vcorr_list else float("nan")
-    avg_rmse_vtotal = float(np.nanmean(rmse_vtotal_list)) if rmse_vtotal_list else float("nan")
-    avg_y_std = float(np.nanmean(y_std_list)) if y_std_list else float("nan")
-
-    metrics = {
-        "avg_rmse_vcorr_mV": avg_rmse_vcorr,
-        "avg_rmse_vtotal_mV": avg_rmse_vtotal,
-        "avg_Y_std": avg_y_std,
-        "num_profiles": len(results),
-    }
-
-    if verbose:
-        print("=" * 60)
-        print(f"[GRU TF TEST] Average RMSE (Vcorr): {avg_rmse_vcorr:.2f} mV")
-        if not np.isnan(avg_rmse_vtotal):
-            print(f"[GRU TF TEST] Average RMSE (Vtotal): {avg_rmse_vtotal:.2f} mV")
-        print(f"[GRU TF TEST] Evaluated {len(results)} profiles")
-        print("=" * 60)
-
-    return results, metrics
