@@ -798,14 +798,17 @@ def split_train_val_test(dict_list, train_ratio=0.6, val_ratio=0.2, test_ratio=0
     if not (0.99 <= total_ratio <= 1.01):
         raise ValueError(f"Ratios must sum to 1.0, got {total_ratio:.3f}")
     
-    # Allow val_ratio=0 (no validation set)
-    # But train_ratio and test_ratio must be > 0
-    if train_ratio <= 0 or test_ratio <= 0:
-        raise ValueError("train_ratio and test_ratio must be > 0")
-    if val_ratio < 0 or val_ratio >= 1:
-        raise ValueError("val_ratio must be >= 0 and < 1")
-    if train_ratio >= 1 or test_ratio >= 1:
-        raise ValueError("train_ratio and test_ratio must be < 1")
+    # Check if each ratio is between 0 and 1 (inclusive)
+    if train_ratio < 0 or train_ratio > 1:
+        raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}")
+    if val_ratio < 0 or val_ratio > 1:
+        raise ValueError(f"val_ratio must be between 0 and 1, got {val_ratio}")
+    if test_ratio < 0 or test_ratio > 1:
+        raise ValueError(f"test_ratio must be between 0 and 1, got {test_ratio}")
+    
+    # At least one ratio must be > 0 (cannot all be 0)
+    if train_ratio == 0 and val_ratio == 0 and test_ratio == 0:
+        raise ValueError("At least one ratio must be > 0")
     
     print("="*50)
     print("Starting 'split_train_val_test()'")

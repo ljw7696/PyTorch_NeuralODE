@@ -155,6 +155,16 @@ class BatteryGRUWrapperTF(nn.Module):
             hidden: Tuple of (gru1_hidden, gru2_hidden) for next timestep
         """
         batch_size = inputs.shape[0]
+        
+        # Handle empty batch
+        if batch_size == 0:
+            # Return empty outputs and dummy hidden states
+            seq_len = inputs.shape[1]
+            dummy_output = torch.zeros(0, seq_len, 1, device=inputs.device, dtype=inputs.dtype)
+            dummy_gru1_hidden = torch.zeros(2, 0, 1, device=inputs.device, dtype=inputs.dtype)
+            dummy_gru2_hidden = torch.zeros(1, 0, 1, device=inputs.device, dtype=inputs.dtype)
+            return dummy_output, (dummy_gru1_hidden, dummy_gru2_hidden)
+        
         x = inputs
         
         gru1_hidden = None
@@ -624,6 +634,18 @@ def train_gru_tf(
     epochs_since_improve = 0
     rmse_window = deque(maxlen=early_stop_window)
     use_validation = val_dict_list is not None and len(val_dict_list) > 0
+    
+    # Fixed subset of training data for evaluation when validation is not available
+    train_eval_subset = None
+    if not use_validation and len(train_dict_list) > 0:
+        # Select 4 samples at 12.5, 37.5, 62.5, 87.5 percentiles
+        n = len(train_dict_list)
+        percentiles = [12.5, 37.5, 62.5, 87.5]
+        indices = [int(n * p / 100.0) for p in percentiles]
+        # Ensure indices are within bounds and unique
+        indices = [min(idx, n - 1) for idx in indices]
+        indices = sorted(list(set(indices)))  # Remove duplicates and sort
+        train_eval_subset = [train_dict_list[i] for i in indices]
 
     if verbose:
         print("\n" + "=" * 70)
@@ -728,18 +750,60 @@ def train_gru_tf(
                             "rmse": overall_rmse,
                             "state_dict": copy.deepcopy(model.state_dict()),
                         }
+        else:
+            # No validation: use fixed subset of training data for autoregressive evaluation
+            model.eval()
+            with torch.no_grad():
+                train_ar_stats = _calculate_autoregressive_rmse_tf(
+                    model=model,
+                    profile_list=train_eval_subset,
+                    device=device,
+                )
+                val_ar_rmse_mV = train_ar_stats["avg_rmse_mV"]
+                val_ar_time_segmented = train_ar_stats.get("time_segmented_rmse", {})
+                
+                # Update best models based on criteria (same logic as validation)
+                if val_ar_time_segmented:
+                    rest_rmse = val_ar_time_segmented.get("rest_after_1730s", float("inf"))
+                    overall_rmse = val_ar_time_segmented.get("all", float("inf"))
+                    
+                    # Check each early segment
+                    for seg_name in ["60s", "120s", "300s", "1200s"]:
+                        early_rmse = val_ar_time_segmented.get(seg_name, float("inf"))
+                        if early_rmse == float("inf") or rest_rmse == float("inf"):
+                            continue
+                        
+                        current_best = best_models[seg_name]
+                        threshold = current_best["early_rmse"] * 1.2  # 20% threshold
+                        
+                        # First epoch or (within threshold and better rest RMSE)
+                        if (current_best["epoch"] == -1) or (early_rmse <= threshold and rest_rmse < current_best["rest_rmse"]):
+                            best_models[seg_name] = {
+                                "epoch": epoch + 1,
+                                "early_rmse": early_rmse,
+                                "rest_rmse": rest_rmse,
+                                "state_dict": copy.deepcopy(model.state_dict()),
+                            }
+                    
+                    # Overall best
+                    if overall_rmse < best_models["overall"]["rmse"]:
+                        best_models["overall"] = {
+                            "epoch": epoch + 1,
+                            "rmse": overall_rmse,
+                            "state_dict": copy.deepcopy(model.state_dict()),
+                        }
 
         # Learning rate scheduling
         monitor_loss = val_loss if use_validation and val_loss is not None else train_loss
         scheduler.step(monitor_loss)
 
-        # Update best model (use auto-regressive RMSE for validation if available)
-        if use_validation and val_ar_rmse_mV is not None:
+        # Update best model (use auto-regressive RMSE if available, otherwise teacher forcing)
+        if val_ar_rmse_mV is not None:
             monitor_rmse_mV = val_ar_rmse_mV  # Use auto-regressive RMSE
         elif use_validation and val_rmse_mV is not None:
-            monitor_rmse_mV = val_rmse_mV  # Fallback to teacher forcing RMSE
+            monitor_rmse_mV = val_rmse_mV  # Fallback to validation teacher forcing RMSE
         else:
-            monitor_rmse_mV = train_rmse_mV
+            monitor_rmse_mV = train_rmse_mV  # Fallback to training teacher forcing RMSE
         
         if monitor_rmse_mV < best_rmse_mV and monitor_rmse_mV == monitor_rmse_mV:  # Check for NaN
             best_rmse_mV = monitor_rmse_mV
@@ -770,7 +834,7 @@ def train_gru_tf(
             "val_loss": val_loss,
             "val_rmse_mV": val_rmse_mV,
             "val_ar_rmse_mV": val_ar_rmse_mV,
-            "val_ar_time_segmented": val_ar_time_segmented if use_validation else {},
+            "val_ar_time_segmented": val_ar_time_segmented if val_ar_time_segmented else {},
             "lr": optimizer.param_groups[0]['lr'],
             "time_elapsed": epoch_elapsed_time,
             "teacher_forcing_ratio": teacher_forcing_ratio,
@@ -786,16 +850,41 @@ def train_gru_tf(
             )
             if use_validation and val_rmse_mV is not None:
                 msg += f" | Val RMSE (TF): {val_rmse_mV:.2f} mV"
-            if use_validation and val_ar_rmse_mV is not None:
-                msg += f" | Val RMSE (AR): {val_ar_rmse_mV:.2f} mV"
+            if val_ar_rmse_mV is not None:
+                label = "Val" if use_validation else "Train"
+                msg += f" | {label} RMSE (AR): {val_ar_rmse_mV:.2f} mV"
             print(msg)
 
-            # Print time-segmented validation RMSE
-            if use_validation and val_ar_time_segmented:
+            # Print time-segmented autoregressive RMSE
+            if val_ar_time_segmented:
                 time_segments = ["30s", "60s", "120s", "180s", "300s", "600s", "900s", "1200s", "all"]
                 seg_strs = [f"{seg}: {val_ar_time_segmented.get(seg, float('nan')):.2f}mV" for seg in time_segments if seg in val_ar_time_segmented]
                 if seg_strs:
                     print(f"  Val RMSE (AR) by time: {' | '.join(seg_strs)}")
+
+        # Save checkpoint every 100 epochs
+        if (epoch + 1) % 100 == 0:
+            base_info = {
+                "best_rmse_mV": best_rmse_mV,
+                "best_rmse_norm": best_rmse,
+                "best_epoch": best_epoch,
+                "current_epoch": epoch + 1,
+                "total_epochs": num_epochs,
+                "lr": lr,
+                "tbptt_length": tbptt_length,
+                "architecture_config": model.architecture_config,
+            }
+            
+            # Save current model with epoch number
+            checkpoint_path = f"best_model_gru_tf_epoch{epoch + 1}_rmse{monitor_rmse_mV:.2f}mV.pth"
+            checkpoint = {
+                "model_state_dict": model.state_dict(),
+                "training_info": {**base_info},
+                "history": history,
+            }
+            torch.save(checkpoint, checkpoint_path)
+            if verbose:
+                print(f"Checkpoint saved: {checkpoint_path}")
 
         # Early stopping
         if early_stop_window > 0 and train_rmse_mV == train_rmse_mV:
@@ -808,6 +897,32 @@ def train_gru_tf(
                     print(f"Early stopping triggered (ΔRMSE <= 0.005 mV over {early_stop_window} epochs).")
                 break
 
+    # Save last epoch model before loading best model
+    if len(history["epochs"]) > 0:
+        last_epoch_info = history["epochs"][-1]
+        last_epoch_num = last_epoch_info["epoch"]
+        if last_epoch_num % 100 != 0:  # Only save if not already saved at 100 epoch interval
+            last_epoch_rmse = last_epoch_info.get("val_ar_rmse_mV") or last_epoch_info.get("train_rmse_mV", 0.0)
+            base_info_last = {
+                "best_rmse_mV": best_rmse_mV,
+                "best_rmse_norm": best_rmse,
+                "best_epoch": best_epoch,
+                "current_epoch": last_epoch_num,
+                "total_epochs": num_epochs,
+                "lr": lr,
+                "tbptt_length": tbptt_length,
+                "architecture_config": model.architecture_config,
+            }
+            last_epoch_path = f"best_model_gru_tf_epoch{last_epoch_num}_rmse{last_epoch_rmse:.2f}mV.pth"
+            checkpoint_last = {
+                "model_state_dict": model.state_dict(),
+                "training_info": {**base_info_last},
+                "history": history,
+            }
+            torch.save(checkpoint_last, last_epoch_path)
+            if verbose:
+                print(f"Last epoch model saved to: {last_epoch_path}")
+
     # Load best model
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -815,19 +930,20 @@ def train_gru_tf(
     if best_epoch == -1:
         best_epoch = history["best"].get("epoch", num_epochs) if history["best"] else num_epochs
 
-    # Save checkpoints
+    # Save checkpoints (final)
     base_info = {
             "best_rmse_mV": best_rmse_mV,
             "best_rmse_norm": best_rmse,
             "best_epoch": best_epoch,
+            "current_epoch": num_epochs,
             "total_epochs": num_epochs,
             "lr": lr,
         "tbptt_length": tbptt_length,
         "architecture_config": model.architecture_config,
     }
     
-    # Save best model (overall)
-    best_model_path = f"best_model_gru_tf_rmse{best_rmse_mV:.2f}mV.pth"
+    # Save best model (overall) with epoch number
+    best_model_path = f"best_model_gru_tf_epoch{best_epoch}_rmse{best_rmse_mV:.2f}mV.pth"
     checkpoint = {
         "model_state_dict": best_state if best_state is not None else model.state_dict(),
         "training_info": {**base_info},
@@ -843,7 +959,7 @@ def train_gru_tf(
         if best_info["epoch"] != -1 and best_info["state_dict"] is not None:
             if seg_name == "overall":
                 continue  # Already saved above
-            path = f"best_model_gru_tf_{seg_name}_early{best_info['early_rmse']:.2f}mV_rest{best_info['rest_rmse']:.2f}mV.pth"
+            path = f"best_model_gru_tf_epoch{best_info['epoch']}_{seg_name}_early{best_info['early_rmse']:.2f}mV_rest{best_info['rest_rmse']:.2f}mV.pth"
             checkpoint = {
                 "model_state_dict": best_info["state_dict"],
                 "training_info": {
@@ -1079,144 +1195,219 @@ def plot_inference_results(
     print(f"[plot_inference_results] Plotting {num_profiles} profiles from results")
     print(f"[plot_inference_results] Input test_dict_list contains {len(test_dict_list)} profiles")
     
+    # Validate input lengths match
+    if len(test_dict_list) != num_profiles:
+        print(f"[plot_inference_results] WARNING: predictions ({num_profiles}) and test_dict_list ({len(test_dict_list)}) lengths don't match")
+        num_profiles = min(num_profiles, len(test_dict_list))
+        predictions = predictions[:num_profiles]
+        test_dict_list = test_dict_list[:num_profiles]
+    
+    # Check if we have any valid profiles to plot
+    if num_profiles == 0:
+        print(f"[plot_inference_results] No valid profiles to plot")
+        fig = go.Figure()
+        fig.update_layout(title="No valid profiles to plot")
+        return fig
+    
+    # Calculate vertical_spacing dynamically based on number of rows
+    # Maximum allowed spacing is 1 / (rows - 1), use 85% of that for safety margin
+    if num_profiles > 1:
+        max_vertical_spacing = 1.0 / (num_profiles - 1)
+        vertical_spacing = min(0.08, max_vertical_spacing * 0.85)
+    else:
+        vertical_spacing = 0.3
+    
+    # Calculate reasonable height (max 8000px to avoid browser issues)
+    base_height_per_profile = 250
+    calculated_height = base_height_per_profile * num_profiles
+    plot_height = min(calculated_height, 8000)
+    
+    if num_profiles > 30:
+        print(f"[plot_inference_results] WARNING: {num_profiles} profiles may result in a very large plot. Consider filtering.")
+    
+    # Generate subplot titles
+    subplot_titles = []
+    for i in range(num_profiles):
+        subplot_titles.append(f"Profile {i+1} - V_meas vs V_spme+V_corr_pred")
+        subplot_titles.append(f"Profile {i+1} - Vcorr vs V_corr_pred")
+    
     # Two subplots per profile: V_meas vs V_spme+V_corr_pred, and Vcorr vs V_corr_pred_denorm
-    fig = make_subplots(
-        rows=num_profiles,
-        cols=2,
-        subplot_titles=[f"Profile {i+1} - V_meas vs V_spme+V_corr_pred" if j == 0 else f"Profile {i+1} - Vcorr vs V_corr_pred" 
-                        for i in range(num_profiles) for j in range(2)],
-        vertical_spacing=0.08,
-        horizontal_spacing=0.1,
-        shared_xaxes=True,
-    )
+    try:
+        fig = make_subplots(
+            rows=num_profiles,
+            cols=2,
+            subplot_titles=subplot_titles,
+            vertical_spacing=vertical_spacing,
+            horizontal_spacing=0.1,
+            shared_xaxes=True,
+        )
+    except Exception as e:
+        print(f"[plot_inference_results] Error creating subplots: {e}")
+        # Fallback: try with smaller spacing if needed
+        if num_profiles > 1:
+            max_vertical_spacing = 1.0 / (num_profiles - 1)
+            vertical_spacing = max_vertical_spacing * 0.8
+        fig = make_subplots(
+            rows=num_profiles,
+            cols=2,
+            subplot_titles=subplot_titles,
+            vertical_spacing=vertical_spacing,
+            horizontal_spacing=0.1,
+            shared_xaxes=True,
+        )
+    
+    # Track successful plots
+    successful_plots = 0
     
     for idx, (pred_dict, profile) in enumerate(zip(predictions, test_dict_list)):
-        print(f"[plot_inference_results] Plotting profile {idx + 1}/{num_profiles}")
-        row = idx + 1
-        time_data = np.array(pred_dict["time"])
-        
-        # Get V_meas from original profile (skip first timestep to match predictions)
-        v_meas = None
-        if "df" in profile:
-            df = profile["df"]
-            if "V_meas" in df.columns:
-                v_meas = df["V_meas"].values[1:]  # Skip first timestep to match predictions
-        elif "V_meas" in profile:
-            v_meas = np.array(profile["V_meas"])[1:]  # Skip first timestep
-        
-        # Get V_corr_pred_denormalized from predictions
-        v_corr_pred_denorm = np.array(pred_dict["pred_denorm"])
-        
-        # Get V_spme from original profile
-        v_spme = None
-        if "df" in profile:
-            df = profile["df"]
-            if "V_spme" in df.columns:
-                v_spme = df["V_spme"].values[1:]  # Skip first timestep
-        elif "V_spme" in profile:
-            v_spme = np.array(profile["V_spme"])[1:]  # Skip first timestep
-        
-        # Get Vcorr (true value) from original profile
-        vcorr = None
-        if "df" in profile:
-            df = profile["df"]
-            if "Vcorr" in df.columns:
-                vcorr = df["Vcorr"].values[1:]  # Skip first timestep
-        elif "Vcorr" in profile:
-            vcorr = np.array(profile["Vcorr"])[1:]  # Skip first timestep
-        
-        # Skip if essential data is missing
-        if v_meas is None or v_spme is None:
-            print(f"  [plot_inference_results] Profile {idx + 1}: Skipped (V_meas or V_spme not found)")
+        try:
+            print(f"[plot_inference_results] Plotting profile {idx + 1}/{num_profiles}")
+            row = idx + 1
+            
+            # Get time data
+            time_data = np.array(pred_dict.get("time", []))
+            if len(time_data) == 0:
+                print(f"  [plot_inference_results] Profile {idx + 1}: No time data, skipping")
+                continue
+            
+            # Get V_meas from original profile (skip first timestep to match predictions)
+            v_meas = None
+            if "df" in profile:
+                df = profile["df"]
+                if "V_meas" in df.columns:
+                    v_meas = df["V_meas"].values[1:]  # Skip first timestep to match predictions
+            elif "V_meas" in profile:
+                v_meas = np.array(profile["V_meas"])[1:]  # Skip first timestep
+            
+            # Get V_corr_pred_denormalized from predictions
+            v_corr_pred_denorm = np.array(pred_dict.get("pred_denorm", []))
+            if len(v_corr_pred_denorm) == 0:
+                print(f"  [plot_inference_results] Profile {idx + 1}: No pred_denorm data, skipping")
+                continue
+            
+            # Get V_spme from original profile
+            v_spme = None
+            if "df" in profile:
+                df = profile["df"]
+                if "V_spme" in df.columns:
+                    v_spme = df["V_spme"].values[1:]  # Skip first timestep
+            elif "V_spme" in profile:
+                v_spme = np.array(profile["V_spme"])[1:]  # Skip first timestep
+            
+            # Get Vcorr (true value) from original profile
+            vcorr = None
+            if "df" in profile:
+                df = profile["df"]
+                if "Vcorr" in df.columns:
+                    vcorr = df["Vcorr"].values[1:]  # Skip first timestep
+            elif "Vcorr" in profile:
+                vcorr = np.array(profile["Vcorr"])[1:]  # Skip first timestep
+            
+            # Skip if essential data is missing
+            if v_meas is None or v_spme is None:
+                print(f"  [plot_inference_results] Profile {idx + 1}: Skipped (V_meas or V_spme not found)")
+                continue
+            
+            # Ensure same length for first subplot (V_meas vs V_spme+V_corr_pred)
+            min_len1 = min(len(time_data), len(v_meas), len(v_spme), len(v_corr_pred_denorm))
+            if min_len1 == 0:
+                print(f"  [plot_inference_results] Profile {idx + 1}: No valid data points, skipping")
+                continue
+                
+            time_data1 = time_data[:min_len1]
+            v_meas_plot = v_meas[:min_len1]
+            v_spme_plot = v_spme[:min_len1]
+            v_corr_pred_denorm1 = v_corr_pred_denorm[:min_len1]
+            
+            # Calculate V_spme + V_corr_pred_denormalized
+            v_spme_corr = v_spme_plot + v_corr_pred_denorm1
+            
+            # Plot 1: V_meas vs V_spme + V_corr_pred (left column)
+            fig.add_trace(
+                go.Scatter(
+                    x=time_data1,
+                    y=v_meas_plot,
+                    mode="lines",
+                    name="V_meas" if idx == 0 else None,
+                    line=dict(color="blue", width=1.5),
+                    legendgroup="v_meas",
+                    showlegend=(idx == 0),
+                ),
+                row=row,
+                col=1,
+            )
+            
+            fig.add_trace(
+                go.Scatter(
+                    x=time_data1,
+                    y=v_spme_corr,
+                    mode="lines",
+                    name="V_spme + V_corr_pred" if idx == 0 else None,
+                    line=dict(color="red", width=1.5, dash="dash"),
+                    legendgroup="v_spme_corr",
+                    showlegend=(idx == 0),
+                ),
+                row=row,
+                col=1,
+            )
+            
+            # Plot 2: Vcorr vs V_corr_pred_denorm (right column)
+            if vcorr is not None and len(vcorr) > 0:
+                min_len2 = min(len(time_data), len(vcorr), len(v_corr_pred_denorm))
+                if min_len2 > 0:
+                    time_data2 = time_data[:min_len2]
+                    vcorr_plot = vcorr[:min_len2]
+                    v_corr_pred_denorm2 = v_corr_pred_denorm[:min_len2]
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=time_data2,
+                            y=vcorr_plot,
+                            mode="lines",
+                            name="Vcorr (true)" if idx == 0 else None,
+                            line=dict(color="green", width=1.5),
+                            legendgroup="vcorr",
+                            showlegend=(idx == 0),
+                        ),
+                        row=row,
+                        col=2,
+                    )
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=time_data2,
+                            y=v_corr_pred_denorm2,
+                            mode="lines",
+                            name="V_corr_pred_denorm" if idx == 0 else None,
+                            line=dict(color="orange", width=1.5, dash="dash"),
+                            legendgroup="v_corr_pred_denorm",
+                            showlegend=(idx == 0),
+                        ),
+                        row=row,
+                        col=2,
+                    )
+            else:
+                print(f"  [plot_inference_results] Profile {idx + 1}: Vcorr not found, skipping second subplot")
+            
+            # Update axes
+            if idx == 0:
+                fig.update_xaxes(title_text="Time (s)", row=row, col=1)
+                fig.update_xaxes(title_text="Time (s)", row=row, col=2)
+            fig.update_yaxes(title_text="Voltage (V)", row=row, col=1)
+            fig.update_yaxes(title_text="Vcorr (V)", row=row, col=2)
+            
+            successful_plots += 1
+            
+        except Exception as e:
+            print(f"  [plot_inference_results] Error plotting profile {idx + 1}: {e}")
             continue
-        
-        # Ensure same length for first subplot (V_meas vs V_spme+V_corr_pred)
-        min_len1 = min(len(time_data), len(v_meas), len(v_spme), len(v_corr_pred_denorm))
-        time_data1 = time_data[:min_len1]
-        v_meas_plot = v_meas[:min_len1]
-        v_spme_plot = v_spme[:min_len1]
-        v_corr_pred_denorm1 = v_corr_pred_denorm[:min_len1]
-        
-        # Calculate V_spme + V_corr_pred_denormalized
-        v_spme_corr = v_spme_plot + v_corr_pred_denorm1
-        
-        # Plot 1: V_meas vs V_spme + V_corr_pred (left column)
-        fig.add_trace(
-            go.Scatter(
-                x=time_data1,
-                y=v_meas_plot,
-                mode="lines",
-                name="V_meas" if idx == 0 else None,
-                line=dict(color="blue", width=1.5),
-                legendgroup="v_meas",
-                showlegend=(idx == 0),
-            ),
-            row=row,
-            col=1,
-        )
-        
-        fig.add_trace(
-            go.Scatter(
-                x=time_data1,
-                y=v_spme_corr,
-                mode="lines",
-                name="V_spme + V_corr_pred" if idx == 0 else None,
-                line=dict(color="red", width=1.5, dash="dash"),
-                legendgroup="v_spme_corr",
-                showlegend=(idx == 0),
-            ),
-            row=row,
-            col=1,
-        )
-        
-        # Plot 2: Vcorr vs V_corr_pred_denorm (right column)
-        if vcorr is not None:
-            min_len2 = min(len(time_data), len(vcorr), len(v_corr_pred_denorm))
-            time_data2 = time_data[:min_len2]
-            vcorr_plot = vcorr[:min_len2]
-            v_corr_pred_denorm2 = v_corr_pred_denorm[:min_len2]
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=time_data2,
-                    y=vcorr_plot,
-                    mode="lines",
-                    name="Vcorr (true)" if idx == 0 else None,
-                    line=dict(color="green", width=1.5),
-                    legendgroup="vcorr",
-                    showlegend=(idx == 0),
-                ),
-                row=row,
-                col=2,
-            )
-            
-            fig.add_trace(
-                go.Scatter(
-                    x=time_data2,
-                    y=v_corr_pred_denorm2,
-                    mode="lines",
-                    name="V_corr_pred_denorm" if idx == 0 else None,
-                    line=dict(color="orange", width=1.5, dash="dash"),
-                    legendgroup="v_corr_pred_denorm",
-                    showlegend=(idx == 0),
-                ),
-                row=row,
-                col=2,
-            )
-        else:
-            print(f"  [plot_inference_results] Profile {idx + 1}: Vcorr not found, skipping second subplot")
-        
-        # Update axes
-        if idx == 0:
-            fig.update_xaxes(title_text="Time (s)", row=row, col=1)
-            fig.update_xaxes(title_text="Time (s)", row=row, col=2)
-        fig.update_yaxes(title_text="Voltage (V)", row=row, col=1)
-        fig.update_yaxes(title_text="Vcorr (V)", row=row, col=2)
+    
+    print(f"[plot_inference_results] Successfully plotted {successful_plots}/{num_profiles} profiles")
     
     avg_rmse = results.get("avg_rmse_mV", float("nan"))
     fig.update_layout(
         title=f"{title_prefix} | Total Profiles: {num_profiles} | Avg RMSE: {avg_rmse:.2f} mV",
-        height=300 * num_profiles,
+        height=plot_height,
         width=1400,  # Wider to accommodate two columns
         hovermode="x unified",
     )

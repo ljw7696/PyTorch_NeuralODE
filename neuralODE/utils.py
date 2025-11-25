@@ -800,14 +800,17 @@ def split_train_val_test(dict_list, train_ratio=0.6, val_ratio=0.2, test_ratio=0
     if not (0.99 <= total_ratio <= 1.01):
         raise ValueError(f"Ratios must sum to 1.0, got {total_ratio:.3f}")
     
-    # Allow val_ratio=0 (no validation set)
-    # But train_ratio and test_ratio must be > 0
-    if train_ratio <= 0 or test_ratio <= 0:
-        raise ValueError("train_ratio and test_ratio must be > 0")
-    if val_ratio < 0 or val_ratio >= 1:
-        raise ValueError("val_ratio must be >= 0 and < 1")
-    if train_ratio >= 1 or test_ratio >= 1:
-        raise ValueError("train_ratio and test_ratio must be < 1")
+    # Check if each ratio is between 0 and 1 (inclusive)
+    if train_ratio < 0 or train_ratio > 1:
+        raise ValueError(f"train_ratio must be between 0 and 1, got {train_ratio}")
+    if val_ratio < 0 or val_ratio > 1:
+        raise ValueError(f"val_ratio must be between 0 and 1, got {val_ratio}")
+    if test_ratio < 0 or test_ratio > 1:
+        raise ValueError(f"test_ratio must be between 0 and 1, got {test_ratio}")
+    
+    # At least one ratio must be > 0 (cannot all be 0)
+    if train_ratio == 0 and val_ratio == 0 and test_ratio == 0:
+        raise ValueError("At least one ratio must be > 0")
     
     print("="*50)
     print("Starting 'split_train_val_test()'")
@@ -1350,6 +1353,8 @@ def filter_Vcorr_regime(extracted_data,
     
     # If input is a single DataFrame, apply filter and return both original and filtered
     if isinstance(extracted_data, pd.DataFrame):
+        if smooth_method is None:
+            return extracted_data.copy(), extracted_data.copy()  # (no filtering, original)
         filtered_df = filter_Vcorr_single(extracted_data, window_size, percentile, 
                                           I_rest_threshold, alpha, Vcorr_col, I_col,
                                           smooth_window, smooth_method)
@@ -1369,9 +1374,12 @@ def filter_Vcorr_regime(extracted_data,
         match = re.search(driving_pattern, key)
         if match:
             soc_num = match.group(1)
-            filtered_df = filter_Vcorr_single(df, window_size, percentile, I_rest_threshold,
-                                              alpha, Vcorr_col, I_col,
-                                              smooth_window, smooth_method)
+            if smooth_method is None:
+                filtered_df = df.copy()
+            else:
+                filtered_df = filter_Vcorr_single(df, window_size, percentile, I_rest_threshold,
+                                                  alpha, Vcorr_col, I_col,
+                                                  smooth_window, smooth_method)
             driving_dict[soc_num] = filtered_df
             driving_dict_orig[soc_num] = df.copy()  # 원본 저장
     
@@ -1382,9 +1390,12 @@ def filter_Vcorr_regime(extracted_data,
         match = re.search(rest_pattern, key)
         if match:
             soc_num = match.group(1)
-            filtered_df = filter_Vcorr_single(df, window_size, percentile, I_rest_threshold,
-                                              alpha, Vcorr_col, I_col,
-                                              smooth_window, smooth_method)
+            if smooth_method is None:
+                filtered_df = df.copy()
+            else:
+                filtered_df = filter_Vcorr_single(df, window_size, percentile, I_rest_threshold,
+                                                  alpha, Vcorr_col, I_col,
+                                                  smooth_window, smooth_method)
             rest_dict[soc_num] = filtered_df
             rest_dict_orig[soc_num] = df.copy()  # 원본 저장
     
