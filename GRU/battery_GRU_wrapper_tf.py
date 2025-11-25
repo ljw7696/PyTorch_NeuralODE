@@ -1210,17 +1210,21 @@ def plot_inference_results(
         return fig
     
     # Calculate vertical_spacing dynamically based on number of rows
-    # Maximum allowed spacing is 1 / (rows - 1), use 85% of that for safety margin
+    # Smaller spacing = taller subplots. Use minimum safe spacing for maximum subplot height
     if num_profiles > 1:
         max_vertical_spacing = 1.0 / (num_profiles - 1)
-        vertical_spacing = min(0.08, max_vertical_spacing * 0.85)
+        # Use smaller spacing (50% of max) to make each subplot taller
+        vertical_spacing = max_vertical_spacing * 0.5
+        # But ensure minimum spacing for readability
+        vertical_spacing = max(vertical_spacing, 0.01)
     else:
         vertical_spacing = 0.3
     
-    # Calculate reasonable height (max 8000px to avoid browser issues)
-    base_height_per_profile = 250
+    # Calculate reasonable height (max 12000px to avoid browser issues)
+    # Increase base height per profile for better visibility
+    base_height_per_profile = 400
     calculated_height = base_height_per_profile * num_profiles
-    plot_height = min(calculated_height, 8000)
+    plot_height = min(calculated_height, 12000)
     
     if num_profiles > 30:
         print(f"[plot_inference_results] WARNING: {num_profiles} profiles may result in a very large plot. Consider filtering.")
@@ -1243,10 +1247,11 @@ def plot_inference_results(
         )
     except Exception as e:
         print(f"[plot_inference_results] Error creating subplots: {e}")
-        # Fallback: try with smaller spacing if needed
+        # Fallback: try with even smaller spacing if needed
         if num_profiles > 1:
             max_vertical_spacing = 1.0 / (num_profiles - 1)
-            vertical_spacing = max_vertical_spacing * 0.8
+            vertical_spacing = max_vertical_spacing * 0.3
+            vertical_spacing = max(vertical_spacing, 0.01)
         fig = make_subplots(
             rows=num_profiles,
             cols=2,
