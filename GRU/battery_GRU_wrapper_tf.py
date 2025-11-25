@@ -21,14 +21,14 @@ class BatteryGRUWrapperTF(nn.Module):
     """
     GRU model wrapper for teacher forcing training.
     
-    Architecture: Bidirectional GRU → Unidirectional GRU → Dense Layers → Linear(1)
+    Architecture: GRU → GRU → Dense Layers → Linear(1)
     
     Input: [V_spme_norm, ocv, SOC, I, T, Y] (6 features) at timestep k
     Output: delta_Vcorr prediction (normalized) for timestep k+1
     
     Parameters:
-        gru1_hidden: Hidden size for bidirectional GRU (0 to skip)
-        gru2_hidden: Hidden size for unidirectional GRU (0 to skip)
+        gru1_hidden: Hidden size for GRU layer 1 (0 to skip)
+        gru2_hidden: Hidden size for GRU layer 2 (0 to skip)
         dense1_hidden: Hidden size for first dense layer (0 to skip)
         dense2_hidden: Hidden size for second dense layer (0 to skip)
     """
@@ -55,25 +55,24 @@ class BatteryGRUWrapperTF(nn.Module):
             "dense2_hidden": dense2_hidden,
         }
 
-        # Bidirectional GRU layer (skip if gru1_hidden == 0)
+        # GRU layer (skip if gru1_hidden == 0)
         self.use_gru1 = gru1_hidden > 0
         if self.use_gru1:
             self.gru1 = nn.GRU(
             input_size=input_size,
                 hidden_size=gru1_hidden,
                 num_layers=1,
-                bidirectional=True,
             batch_first=True,
         )
         else:
             self.gru1 = None
         
-        # Unidirectional GRU layer (skip if gru2_hidden == 0)
+        # GRU layer (skip if gru2_hidden == 0)
         self.use_gru2 = gru2_hidden > 0
         if self.use_gru2:
             # Determine input size for gru2
             if self.use_gru1:
-                gru2_input_size = gru1_hidden * 2  # Bidirectional output
+                gru2_input_size = gru1_hidden
             else:
                 gru2_input_size = input_size  # Skip gru1, use input directly
             
@@ -81,7 +80,6 @@ class BatteryGRUWrapperTF(nn.Module):
                 input_size=gru2_input_size,
                 hidden_size=gru2_hidden,
                 num_layers=1,
-                bidirectional=False,
             batch_first=True,
         )
         else:
@@ -91,7 +89,7 @@ class BatteryGRUWrapperTF(nn.Module):
         if self.use_gru2:
             dense_input_size = gru2_hidden
         elif self.use_gru1:
-            dense_input_size = gru1_hidden * 2  # Bidirectional output
+            dense_input_size = gru1_hidden
         else:
             dense_input_size = input_size
         
@@ -170,15 +168,15 @@ class BatteryGRUWrapperTF(nn.Module):
         gru1_hidden = None
         gru2_hidden = None
         
-        # Bidirectional GRU
+        # GRU layer 1
         if self.use_gru1:
             if hidden is not None:
                 gru1_hidden_prev, _ = hidden
                 x, gru1_hidden = self.gru1(x, gru1_hidden_prev)
             else:
-                x, gru1_hidden = self.gru1(x)  # [batch_size, seq_len, gru1_hidden * 2]
+                x, gru1_hidden = self.gru1(x)  # [batch_size, seq_len, gru1_hidden]
         
-        # Unidirectional GRU
+        # GRU layer 2
         if self.use_gru2:
             if hidden is not None:
                 _, gru2_hidden_prev = hidden
@@ -192,11 +190,11 @@ class BatteryGRUWrapperTF(nn.Module):
                 num_layers1 = self.gru1.num_layers
                 hidden_size1 = self.gru1.hidden_size
                 gru1_hidden = torch.zeros(
-                    num_layers1 * 2, batch_size, hidden_size1,
+                    num_layers1, batch_size, hidden_size1,
                     device=x.device, dtype=x.dtype
                 )
             else:
-                gru1_hidden = torch.zeros(2, batch_size, 1, device=x.device, dtype=x.dtype)
+                gru1_hidden = torch.zeros(1, batch_size, 1, device=x.device, dtype=x.dtype)
         
         if gru2_hidden is None:
             if self.use_gru2:
@@ -574,8 +572,8 @@ def train_gru_tf(
         device: Device to use
         early_stop_window: Window size for early stopping
         verbose: Print training progress
-        gru1_hidden: Bidirectional GRU hidden size (0 to skip)
-        gru2_hidden: Unidirectional GRU hidden size (0 to skip)
+        gru1_hidden: GRU layer 1 hidden size (0 to skip)
+        gru2_hidden: GRU layer 2 hidden size (0 to skip)
         dense1_hidden: First dense layer hidden size (0 to skip)
         dense2_hidden: Second dense layer hidden size (0 to skip)
         tbptt_length: TBPTT chunk length
@@ -651,7 +649,7 @@ def train_gru_tf(
         print("\n" + "=" * 70)
         print("GRU Teacher Forcing Training Configuration")
         print("=" * 70)
-        print(f"Architecture: GRU1(bidir={gru1_hidden}) → GRU2({gru2_hidden}) → Dense1({dense1_hidden}) → Dense2({dense2_hidden})")
+        print(f"Architecture: GRU1({gru1_hidden}) → GRU2({gru2_hidden}) → Dense1({dense1_hidden}) → Dense2({dense2_hidden})")
         print(f"Device       : {device}")
         print(f"Epochs       : {num_epochs}")
         print(f"Learning rate: {lr}")
