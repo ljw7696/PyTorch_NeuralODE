@@ -1062,13 +1062,18 @@ def filter_Vcorr_lpf_single(df,
                              Vcorr_col='Vcorr',
                              I_col='current'):
     """
-    Apply hybrid rest + LPF filtering to a single DataFrame.
+    Apply hybrid rest + LPF filtering to a single DataFrame with general smoothing.
     
     Filtering algorithm:
     1. Find rest regions where |I| < I_rest_threshold (anchors)
-    2. Use raw Vcorr at rest points (anchoring)
-    3. Fill between rest points with LPF: Vslow(t) = (1-α)*Vslow(t-1) + α*Vcorr(t)
-    4. Fill tail after last rest with LPF
+    2. Use raw Vcorr at rest points (anchoring, no smoothing)
+    3. Fill between rest points with general LPF smoothing:
+       - Current direction affects Vcorr bias:
+         * Discharge (+ current) → Vcorr decreases (negative bias)
+         * Charge (- current) → Vcorr increases (positive bias)
+       - General LPF: Vslow(t) = (1-α)*Vslow(t-1) + α*(Vcorr(t) + bias)
+       - Smoothly connects to rest points (anchors)
+    4. Fill tail after last rest with general LPF
     
     Args:
         df: pandas DataFrame with Vcorr and current columns
@@ -1091,88 +1096,80 @@ def filter_Vcorr_lpf_single(df,
     
     Vslow = np.zeros_like(Vcorr)
     
+    # 전류 방향: + (방전) → Vcorr 감소, - (충전) → Vcorr 증가
+    I_direction = np.sign(I)  # +1 (방전), -1 (충전), 0 (rest)
+    
+    # Vcorr 범위 계산 (bias 크기 결정용)
+    Vcorr_range = np.max(Vcorr) - np.min(Vcorr) if len(Vcorr) > 1 else abs(Vcorr[0]) if len(Vcorr) > 0 else 1.0
+    
     # 1) rest index 추출 (앵커)
     rest_mask = np.abs(I) < I_rest_threshold
     rest_indices = np.where(rest_mask)[0]
-    
-    # 보호: rest가 없다면 그냥 LPF 반환
-    if len(rest_indices) == 0:
-        Vslow[0] = Vcorr[0]
-        for t in range(1, N):
-            Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * Vcorr[t]
-        df_copy[Vcorr_col] = Vslow
-        return df_copy
     
     # 2) 모든 rest 지점에서 raw Vcorr 사용 (앵커 고정, 손대지 않음)
     for rest_idx in rest_indices:
         Vslow[rest_idx] = Vcorr[rest_idx]
     
     # 3) 첫 rest 이전 구간 처리 (0부터 첫 rest까지)
-    first_rest = rest_indices[0]
-    if first_rest > 0:
-        # 첫 rest 값에 수렴하도록 backward LPF
+    if len(rest_indices) > 0:
+        first_rest = rest_indices[0]
+        if first_rest > 0:
+            Vslow[0] = Vcorr[0]
+            for t in range(1, first_rest):
+                # 전류 방향에 따른 Vcorr bias: 방전(+) → 감소, 충전(-) → 증가
+                # 전류 크기에 비례한 bias (최대 Vcorr 범위의 1%)
+                I_magnitude = abs(I[t]) / max(np.max(np.abs(I)), I_rest_threshold * 2) if len(I) > 0 else 0.0
+                current_bias = -I_direction[t] * I_magnitude * Vcorr_range * 0.01
+                Vcorr_adjusted = Vcorr[t] + current_bias
+                
+                # 일반적인 LPF smoothing
+                Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * Vcorr_adjusted
+    else:
+        # Rest가 없는 경우: 전체 구간에 일반적인 LPF 적용
         Vslow[0] = Vcorr[0]
-        for t in range(1, first_rest):
-            # 목표: first_rest의 값에 가까워지도록
-            target = Vcorr[first_rest]
-            progress = t / first_rest  # 0에서 1로
-            # 더 부드러운 전환을 위해 가중치 조정
-            Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * (Vcorr[t] * (1 - progress * 0.5) + target * progress * 0.5)
+        for t in range(1, N):
+            # 전류 방향에 따른 Vcorr bias
+            I_magnitude = abs(I[t]) / max(np.max(np.abs(I)), I_rest_threshold * 2) if len(I) > 0 else 0.0
+            current_bias = -I_direction[t] * I_magnitude * Vcorr_range * 0.01
+            Vcorr_adjusted = Vcorr[t] + current_bias
+            
+            # 일반적인 LPF smoothing
+            Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * Vcorr_adjusted
+        df_copy[Vcorr_col] = Vslow
+        return df_copy
     
-    # 4) rest 구간 사이를 LPF로 채우기 (양방향으로 부드럽게 연결)
-    for i in range(len(rest_indices) - 1):
-        k0 = rest_indices[i]
-        k1 = rest_indices[i+1]
-        
-        # k0와 k1은 이미 앵커로 고정됨 (raw Vcorr)
-        # k0~k1 사이를 부드럽게 연결
-        if k1 - k0 > 1:
-            # 선형 보간으로 먼저 초기 추정값 생성 (매우 부드러운 베이스라인)
-            linear_base = np.linspace(Vcorr[k0], Vcorr[k1], k1 - k0 + 1)
+    # 4) rest 구간 사이를 LPF로 채우기 (일반적인 smoothing)
+    if len(rest_indices) > 1:
+        for i in range(len(rest_indices) - 1):
+            k0 = rest_indices[i]
+            k1 = rest_indices[i+1]
             
-            # Forward pass: k0에서 시작해서 k1 방향으로
-            Vslow_forward = np.zeros(k1 - k0 + 1)
-            Vslow_forward[0] = Vcorr[k0]  # 앵커
-            for t in range(k0 + 1, k1):
-                idx = t - k0
-                # 선형 보간 30% 사용 (30% 선형 보간 + 70% LPF)
-                linear_val = linear_base[idx]
-                Vslow_forward[idx] = (1 - alpha) * Vslow_forward[idx - 1] + alpha * (linear_val * 0.3 + Vcorr[t] * 0.7)
-            
-            # Backward pass: k1에서 시작해서 k0 방향으로
-            Vslow_backward = np.zeros(k1 - k0 + 1)
-            Vslow_backward[-1] = Vcorr[k1]  # 앵커
-            for t in range(k1 - 1, k0, -1):
-                idx = t - k0
-                # 선형 보간 30% 사용
-                linear_val = linear_base[idx]
-                Vslow_backward[idx] = (1 - alpha) * Vslow_backward[idx + 1] + alpha * (linear_val * 0.3 + Vcorr[t] * 0.7)
-            
-            # Forward와 backward의 균등 평균 (더 부드러운 연결)
-            for t in range(k0 + 1, k1):
-                idx = t - k0
-                # 선형 보간도 함께 고려
-                linear_val = linear_base[idx]
-                # 3-way 평균: forward, backward, linear
-                Vslow[t] = 0.4 * Vslow_forward[idx] + 0.4 * Vslow_backward[idx] + 0.2 * linear_val
-            
-            # 추가 smoothing: 인접한 값들의 평균 (step-wise 제거)
-            if k1 - k0 > 3:
+            # k0와 k1은 이미 앵커로 고정됨 (raw Vcorr)
+            # k0~k1 사이를 일반적인 LPF로 연결
+            if k1 - k0 > 1:
+                # Forward pass: k0에서 k1 방향으로
                 for t in range(k0 + 1, k1):
-                    # 양쪽 인접 값과의 가중 평균
-                    if t > k0 + 1 and t < k1 - 1:
-                        Vslow[t] = 0.5 * Vslow[t] + 0.25 * Vslow[t-1] + 0.25 * Vslow[t+1]
-                    elif t == k0 + 1:
-                        Vslow[t] = 0.6 * Vslow[t] + 0.4 * Vslow[t+1]
-                    elif t == k1 - 1:
-                        Vslow[t] = 0.6 * Vslow[t] + 0.4 * Vslow[t-1]
+                    # 전류 방향에 따른 Vcorr bias
+                    I_magnitude = abs(I[t]) / max(np.max(np.abs(I)), I_rest_threshold * 2) if len(I) > 0 else 0.0
+                    current_bias = -I_direction[t] * I_magnitude * Vcorr_range * 0.01
+                    Vcorr_adjusted = Vcorr[t] + current_bias
+                    
+                    # 일반적인 LPF smoothing
+                    Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * Vcorr_adjusted
     
-    # 5) 마지막 rest 이후 tail 구간도 LPF
-    last_rest = rest_indices[-1]
-    if last_rest < N - 1:
-        Vslow[last_rest] = Vcorr[last_rest]  # 앵커 유지
-        for t in range(last_rest + 1, N):
-            Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * Vcorr[t]
+    # 5) 마지막 rest 이후 tail 구간도 일반적인 LPF
+    if len(rest_indices) > 0:
+        last_rest = rest_indices[-1]
+        if last_rest < N - 1:
+            Vslow[last_rest] = Vcorr[last_rest]  # 앵커 유지
+            for t in range(last_rest + 1, N):
+                # 전류 방향에 따른 Vcorr bias
+                I_magnitude = abs(I[t]) / max(np.max(np.abs(I)), I_rest_threshold * 2) if len(I) > 0 else 0.0
+                current_bias = -I_direction[t] * I_magnitude * Vcorr_range * 0.01
+                Vcorr_adjusted = Vcorr[t] + current_bias
+                
+                # 일반적인 LPF smoothing
+                Vslow[t] = (1 - alpha) * Vslow[t-1] + alpha * Vcorr_adjusted
     
     # Update Vcorr column with filtered values
     df_copy[Vcorr_col] = Vslow
@@ -1196,11 +1193,14 @@ def filter_Vcorr_lpf_regime(extracted_data,
     6. Concatenate matched profiles (rest time starts from driving end time + 1s)
     7. Return as list of DataFrames
     
-    Filtering algorithm:
+    Filtering algorithm (applied via filter_Vcorr_lpf_single):
     1. Find rest regions where |I| < I_rest_threshold (anchors)
-    2. Use raw Vcorr at rest points (anchoring)
-    3. Fill between rest points with LPF: Vslow(t) = (1-α)*Vslow(t-1) + α*Vcorr(t)
-    4. Fill tail after last rest with LPF
+    2. Use raw Vcorr at rest points (anchoring, no smoothing)
+    3. Fill between rest points with current-aware LPF:
+       - Current magnitude affects smoothing strength
+       - Higher current → stronger smoothing
+       - Vslow(t) = (1-α_current)*Vslow(t-1) + α_current*Vcorr(t)
+    4. Fill tail after last rest with current-aware LPF
     
     Input:
         extracted_data: dict with keys like 'udds2_1c_drivingonly_25C_SOC_53' and DataFrame values

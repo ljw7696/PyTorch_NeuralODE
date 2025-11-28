@@ -560,6 +560,7 @@ def train_gru_tf(
     dense2_hidden: int = 12,
     tbptt_length: int = 200,
     p_final: float = 1.0,
+    pre_trained_model: Optional[BatteryGRUWrapperTF] = None,
 ) -> Tuple[BatteryGRUWrapperTF, Dict[str, Any]]:
     """
     Train GRU with teacher forcing and TBPTT.
@@ -578,6 +579,7 @@ def train_gru_tf(
         dense2_hidden: Second dense layer hidden size (0 to skip)
         tbptt_length: TBPTT chunk length
         p_final: Final teacher forcing ratio for exponential scheduled sampling (1.0 = pure TF)
+        pre_trained_model: Optional pre-trained model to continue training from (if None, creates new model)
     
     Returns:
         Trained model and training history
@@ -585,18 +587,26 @@ def train_gru_tf(
     device = torch.device(device)
     
     # Initialize model
-    model = BatteryGRUWrapperTF(
-        input_size=6,
-        gru1_hidden=gru1_hidden,
-        gru2_hidden=gru2_hidden,
-        dense1_hidden=dense1_hidden,
-        dense2_hidden=dense2_hidden,
-        device=device,
-    ).to(device)
+    if pre_trained_model is not None:
+        # Use pre-trained model (continue training)
+        model = pre_trained_model.to(device)
+        model.train()  # Set to training mode
+        if verbose:
+            print("[train_gru_tf] Using pre-trained model, continuing training...")
+    else:
+        # Create new model
+        model = BatteryGRUWrapperTF(
+            input_size=6,
+            gru1_hidden=gru1_hidden,
+            gru2_hidden=gru2_hidden,
+            dense1_hidden=dense1_hidden,
+            dense2_hidden=dense2_hidden,
+            device=device,
+        ).to(device)
     
     optimizer = optim.AdamW(model.parameters(), lr=lr, eps=1e-8, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=10, threshold=1e-3, threshold_mode="rel"
+        optimizer, mode="min", factor=0.5, patience=10, threshold=0.5, threshold_mode="abs", min_lr=1e-6
     )
 
     history: Dict[str, Any] = {
@@ -791,10 +801,6 @@ def train_gru_tf(
                             "state_dict": copy.deepcopy(model.state_dict()),
                         }
 
-        # Learning rate scheduling
-        monitor_loss = val_loss if use_validation and val_loss is not None else train_loss
-        scheduler.step(monitor_loss)
-
         # Update best model (use auto-regressive RMSE if available, otherwise teacher forcing)
         if val_ar_rmse_mV is not None:
             monitor_rmse_mV = val_ar_rmse_mV  # Use auto-regressive RMSE
@@ -802,6 +808,12 @@ def train_gru_tf(
             monitor_rmse_mV = val_rmse_mV  # Fallback to validation teacher forcing RMSE
         else:
             monitor_rmse_mV = train_rmse_mV  # Fallback to training teacher forcing RMSE
+        
+        # Monitor loss for best_rmse calculation
+        monitor_loss = val_loss if use_validation and val_loss is not None else train_loss
+        
+        # Learning rate scheduling (use RMSE with absolute threshold 0.5mV)
+        # scheduler.step(monitor_rmse_mV)  # Comment out for fixed learning rate
         
         if monitor_rmse_mV < best_rmse_mV and monitor_rmse_mV == monitor_rmse_mV:  # Check for NaN
             best_rmse_mV = monitor_rmse_mV
@@ -883,6 +895,39 @@ def train_gru_tf(
             torch.save(checkpoint, checkpoint_path)
             if verbose:
                 print(f"Checkpoint saved: {checkpoint_path}")
+            
+            # Save criteria-based best models every 100 epochs
+            for seg_name, best_info in best_models.items():
+                if best_info["epoch"] != -1 and best_info["state_dict"] is not None:
+                    if seg_name == "overall":
+                        path = f"best_model_gru_tf_epoch{best_info['epoch']}_overall_rmse{best_info['rmse']:.2f}mV.pth"
+                        checkpoint = {
+                            "model_state_dict": best_info["state_dict"],
+                            "training_info": {
+                                **base_info,
+                                "criteria": seg_name,
+                                "rmse_mV": best_info["rmse"],
+                            },
+                            "history": history,
+                        }
+                    else:
+                        path = f"best_model_gru_tf_epoch{best_info['epoch']}_{seg_name}_early{best_info['early_rmse']:.2f}mV_rest{best_info['rest_rmse']:.2f}mV.pth"
+                        checkpoint = {
+                            "model_state_dict": best_info["state_dict"],
+                            "training_info": {
+                                **base_info,
+                                "criteria": seg_name,
+                                "early_rmse_mV": best_info["early_rmse"],
+                                "rest_rmse_mV": best_info["rest_rmse"],
+                            },
+                            "history": history,
+                        }
+                    torch.save(checkpoint, path)
+                    if verbose:
+                        if seg_name == "overall":
+                            print(f"  {seg_name} best (epoch {best_info['epoch']}): {path}")
+                        else:
+                            print(f"  {seg_name} best (epoch {best_info['epoch']}): {path}")
 
         # Early stopping
         if early_stop_window > 0 and train_rmse_mV == train_rmse_mV:
@@ -1022,6 +1067,8 @@ def inference_gru_tf(
     test_dict_list: Sequence[Dict[str, Any]],
     device: Union[str, torch.device] = "cpu",
     return_predictions: bool = True,
+    training_info: Optional[Dict[str, Any]] = None,
+    history: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Perform inference on test data using auto-regressive rollout.
@@ -1031,6 +1078,8 @@ def inference_gru_tf(
         test_dict_list: List of test profiles (dict format)
         device: Device to run inference on
         return_predictions: If True, return predictions for each profile
+        training_info: Optional training information dict (from checkpoint) to display epoch and lr
+        history: Optional history dict (from train_gru_tf) to display epoch and lr
     
     Returns:
         Dictionary containing:
@@ -1045,6 +1094,46 @@ def inference_gru_tf(
     if not test_dict_list:
         return {"avg_rmse_mV": float("nan"), "rmse_list": [], "time_segmented_rmse": {}}
     
+    # Print model information
+    print("=" * 70)
+    print("Model Information")
+    print("=" * 70)
+    if hasattr(model, 'architecture_config'):
+        arch_config = model.architecture_config
+        print(f"Input size      : {arch_config.get('input_size', 'N/A')}")
+        print(f"GRU1 hidden     : {arch_config.get('gru1_hidden', 'N/A')}")
+        print(f"GRU2 hidden     : {arch_config.get('gru2_hidden', 'N/A')}")
+        print(f"Dense1 hidden   : {arch_config.get('dense1_hidden', 'N/A')}")
+        print(f"Dense2 hidden   : {arch_config.get('dense2_hidden', 'N/A')}")
+        print(f"Dropout         : {arch_config.get('dropout', 'N/A')}")
+    else:
+        # Fallback: try to get from model attributes
+        print(f"Input size      : {getattr(model, 'input_size', 'N/A')}")
+        print(f"GRU1 hidden     : {model.gru1.hidden_size if model.use_gru1 else 0}")
+        print(f"GRU2 hidden     : {model.gru2.hidden_size if model.use_gru2 else 0}")
+        print(f"Dense1 hidden   : {model.dense1.out_features if model.use_dense1 else 0}")
+        print(f"Dense2 hidden   : {model.dense2.out_features if model.use_dense2 else 0}")
+    
+    # Print training information
+    if training_info and len(training_info) > 0:
+        best_epoch = training_info.get('best_epoch', training_info.get('current_epoch', 'N/A'))
+        lr = training_info.get('lr', 'N/A')
+        total_epochs = training_info.get('total_epochs', 'N/A')
+    elif history:
+        # Extract from history dict (from train_gru_tf)
+        config = history.get('config', {})
+        best_info = history.get('best', {})
+        best_epoch = best_info.get('epoch', 'N/A')
+        lr = config.get('lr', 'N/A')
+        total_epochs = config.get('num_epochs', 'N/A')
+    else:
+        best_epoch = 'N/A'
+        lr = 'N/A'
+        total_epochs = 'N/A'
+    print(f"Best epoch      : {best_epoch}")
+    print(f"Total epochs    : {total_epochs}")
+    print(f"Learning rate   : {lr}")
+    print("=" * 70)
     print(f"[inference_gru_tf] Input test_dict_list contains {len(test_dict_list)} profiles")
     
     rmse_list: List[float] = []
@@ -1227,13 +1316,20 @@ def plot_inference_results(
     if num_profiles > 30:
         print(f"[plot_inference_results] WARNING: {num_profiles} profiles may result in a very large plot. Consider filtering.")
     
-    # Generate subplot titles
+    # Get RMSE list for each profile
+    rmse_list = results.get("rmse_list", [])
+    
+    # Generate subplot titles with RMSE for each profile
     subplot_titles = []
     for i in range(num_profiles):
-        subplot_titles.append(f"Profile {i+1} - V_meas vs V_spme+V_corr_pred")
-        subplot_titles.append(f"Profile {i+1} - Vcorr vs V_corr_pred")
+        profile_rmse = rmse_list[i] if i < len(rmse_list) else float("nan")
+        rmse_str = f"AR RMSE: {profile_rmse:.2f} mV" if not np.isnan(profile_rmse) else "AR RMSE: N/A"
+        subplot_titles.append(f"Profile {i+1} - V_meas vs V_spme+V_corr_pred ({rmse_str})")
+        subplot_titles.append(f"Profile {i+1} - Vcorr vs V_corr_pred ({rmse_str})")
     
     # Two subplots per profile: V_meas vs V_spme+V_corr_pred, and Vcorr vs V_corr_pred_denorm
+    # Right column subplots need secondary y-axis for SOC
+    specs = [[{"secondary_y": False}, {"secondary_y": True}]] * num_profiles
     try:
         fig = make_subplots(
             rows=num_profiles,
@@ -1242,6 +1338,7 @@ def plot_inference_results(
             vertical_spacing=vertical_spacing,
             horizontal_spacing=0.1,
             shared_xaxes=True,
+            specs=specs,
         )
     except Exception as e:
         print(f"[plot_inference_results] Error creating subplots: {e}")
@@ -1250,6 +1347,7 @@ def plot_inference_results(
             max_vertical_spacing = 1.0 / (num_profiles - 1)
             vertical_spacing = max_vertical_spacing * 0.3
             vertical_spacing = max(vertical_spacing, 0.01)
+        specs = [[{"secondary_y": False}, {"secondary_y": True}]] * num_profiles
         fig = make_subplots(
             rows=num_profiles,
             cols=2,
@@ -1257,6 +1355,7 @@ def plot_inference_results(
             vertical_spacing=vertical_spacing,
             horizontal_spacing=0.1,
             shared_xaxes=True,
+            specs=specs,
         )
     
     # Track successful plots
@@ -1305,6 +1404,15 @@ def plot_inference_results(
                     vcorr = df["Vcorr"].values[1:]  # Skip first timestep
             elif "Vcorr" in profile:
                 vcorr = np.array(profile["Vcorr"])[1:]  # Skip first timestep
+            
+            # Get SOC from original profile
+            soc = None
+            if "df" in profile:
+                df = profile["df"]
+                if "SOC" in df.columns:
+                    soc = df["SOC"].values[1:]  # Skip first timestep
+            elif "SOC" in profile:
+                soc = np.array(profile["SOC"])[1:]  # Skip first timestep
             
             # Skip if essential data is missing
             if v_meas is None or v_spme is None:
@@ -1389,6 +1497,28 @@ def plot_inference_results(
                         row=row,
                         col=2,
                     )
+                    
+                    # Add SOC on secondary y-axis (right side)
+                    if soc is not None and len(soc) > 0:
+                        min_len_soc = min(len(time_data2), len(soc))
+                        if min_len_soc > 0:
+                            time_data_soc = time_data2[:min_len_soc]
+                            soc_plot = soc[:min_len_soc]
+                            
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=time_data_soc,
+                                    y=soc_plot,
+                                    mode="lines",
+                                    name="SOC" if idx == 0 else None,
+                                    line=dict(color="purple", width=1.5, dash="dot"),
+                                    legendgroup="soc",
+                                    showlegend=(idx == 0),
+                                ),
+                                row=row,
+                                col=2,
+                                secondary_y=True,
+                            )
             else:
                 print(f"  [plot_inference_results] Profile {idx + 1}: Vcorr not found, skipping second subplot")
             
@@ -1398,6 +1528,8 @@ def plot_inference_results(
                 fig.update_xaxes(title_text="Time (s)", row=row, col=2)
             fig.update_yaxes(title_text="Voltage (V)", row=row, col=1)
             fig.update_yaxes(title_text="Vcorr (V)", row=row, col=2)
+            # Update secondary y-axis for SOC
+            fig.update_yaxes(title_text="SOC", row=row, col=2, secondary_y=True)
             
             successful_plots += 1
             
@@ -1409,7 +1541,7 @@ def plot_inference_results(
     
     avg_rmse = results.get("avg_rmse_mV", float("nan"))
     fig.update_layout(
-        title=f"{title_prefix} | Total Profiles: {num_profiles} | Avg RMSE: {avg_rmse:.2f} mV",
+        title=f"{title_prefix} | Total Profiles: {num_profiles} | AR roll-out RMSE: {avg_rmse:.2f} mV",
         height=plot_height,
         width=1400,  # Wider to accommodate two columns
         hovermode="x unified",
