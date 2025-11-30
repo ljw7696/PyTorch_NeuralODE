@@ -438,6 +438,7 @@ def _train_pass_tbptt_tf(
     # TBPTT: Process in chunks
     chunk_losses = []
     total_valid_steps = 0
+    grad_norms = []  # Track gradient norms
     
     # Process from k=0 to k=max_valid_length-2 (since target is k+1)
     # We can predict k+1 for k in range(0, max_valid_length-1)
@@ -514,8 +515,22 @@ def _train_pass_tbptt_tf(
                 optimizer.zero_grad()
                 chunk_loss.backward()
                 
+                # Calculate gradient norm before clipping
+                total_grad_norm_before = 0.0
+                for param in model.parameters():
+                    if param.grad is not None:
+                        param_grad_norm = param.grad.data.norm(2)
+                        total_grad_norm_before += param_grad_norm.item() ** 2
+                total_grad_norm_before = total_grad_norm_before ** 0.5
+                
                 # Gradient clipping
-                nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                clipped_grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Store both before and after clipping
+                grad_norms.append({
+                    "before_clip": total_grad_norm_before,
+                    "after_clip": clipped_grad_norm.item()
+                })
                 optimizer.step()
                 
                 # Detach hidden state after backward
@@ -539,10 +554,16 @@ def _train_pass_tbptt_tf(
     else:
         rmse_mV = float("nan")
     
+    # Calculate average gradient norm (before clipping)
+    avg_grad_norm_before = float(np.mean([g["before_clip"] for g in grad_norms])) if grad_norms else 0.0
+    avg_grad_norm_after = float(np.mean([g["after_clip"] for g in grad_norms])) if grad_norms else 0.0
+    
     return {
         "num_steps": total_valid_steps,
         "rmse_mV": rmse_mV,
         "total_loss": total_loss,
+        "grad_norm": avg_grad_norm_before,  # Before clipping for reference
+        "grad_norm_clipped": avg_grad_norm_after,  # After clipping
     }
 
 
@@ -560,6 +581,7 @@ def train_gru_tf(
     dense2_hidden: int = 12,
     tbptt_length: int = 200,
     p_final: float = 1.0,
+    p_initial: float = 1.0,
     pre_trained_model: Optional[BatteryGRUWrapperTF] = None,
 ) -> Tuple[BatteryGRUWrapperTF, Dict[str, Any]]:
     """
@@ -578,7 +600,8 @@ def train_gru_tf(
         dense1_hidden: First dense layer hidden size (0 to skip)
         dense2_hidden: Second dense layer hidden size (0 to skip)
         tbptt_length: TBPTT chunk length
-        p_final: Final teacher forcing ratio for exponential scheduled sampling (1.0 = pure TF)
+        p_final: Final teacher forcing ratio for scheduled sampling (1.0 = pure TF)
+        p_initial: Initial teacher forcing ratio for scheduled sampling (default: 1.0 = start with pure TF)
         pre_trained_model: Optional pre-trained model to continue training from (if None, creates new model)
     
     Returns:
@@ -623,6 +646,7 @@ def train_gru_tf(
             "dense2_hidden": dense2_hidden,
             "tbptt_length": tbptt_length,
             "p_final": p_final,
+            "p_initial": p_initial,
             "architecture_config": model.architecture_config,
         }
     }
@@ -669,15 +693,20 @@ def train_gru_tf(
         print(f"Early-stop    : window={early_stop_window}")
         print("=" * 70 + "\n")
 
-    # Calculate exponential scheduled sampling decay factor
-    gamma = p_final ** (1.0 / num_epochs) if p_final > 0 else 0.0
+    # Calculate scheduled sampling decay (linear)
+    # Linear decay: teacher_forcing_ratio decreases linearly from p_initial to p_final
 
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
         model.train()
         
-        # Calculate teacher forcing ratio for this epoch (exponential decay)
-        teacher_forcing_ratio = gamma ** epoch if p_final < 1.0 else 1.0
+        # Calculate teacher forcing ratio for this epoch (linear decay)
+        if p_initial != p_final:
+            # Linear decay: from p_initial at epoch 0 to p_final at epoch (num_epochs-1)
+            teacher_forcing_ratio = p_initial - (p_initial - p_final) * (epoch / (num_epochs - 1))
+        else:
+            # Constant: no decay
+            teacher_forcing_ratio = p_initial
         
         if verbose:
             print(f"  Teacher forcing ratio: {teacher_forcing_ratio:.4f} ({teacher_forcing_ratio*100:.2f}% true, {((1-teacher_forcing_ratio)*100):.2f}% predicted)")
@@ -699,6 +728,8 @@ def train_gru_tf(
         
         train_rmse_mV = train_stats["rmse_mV"]
         train_loss = train_stats["total_loss"]
+        train_grad_norm = train_stats.get("grad_norm", 0.0)
+        train_grad_norm_clipped = train_stats.get("grad_norm_clipped", 0.0)
         
         # Validation
         val_rmse_mV = None
@@ -852,11 +883,14 @@ def train_gru_tf(
         history["epochs"].append(epoch_info)
 
         if verbose:
+            # Calculate effective step size (gradient * learning rate)
+            effective_step = train_grad_norm_clipped * optimizer.param_groups[0]['lr']
             msg = (
                 f"Epoch {epoch + 1:3d}/{num_epochs} | "
                 f"Time: {epoch_elapsed_time:.1f}s | "
                 f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
-                f"Loss: {train_loss:.4e} | Train RMSE: {train_rmse_mV:.2f} mV"
+                f"Loss: {train_loss:.4e} | Grad: {train_grad_norm:.4e} (clipped: {train_grad_norm_clipped:.4e}) | "
+                f"Step: {effective_step:.2e} | Train RMSE: {train_rmse_mV:.2f} mV"
             )
             if use_validation and val_rmse_mV is not None:
                 msg += f" | Val RMSE (TF): {val_rmse_mV:.2f} mV"
@@ -1069,6 +1103,7 @@ def inference_gru_tf(
     return_predictions: bool = True,
     training_info: Optional[Dict[str, Any]] = None,
     history: Optional[Dict[str, Any]] = None,
+    tf_inference: bool = False,
 ) -> Dict[str, Any]:
     """
     Perform inference on test data using auto-regressive rollout.
@@ -1165,8 +1200,11 @@ def inference_gru_tf(
             for k in range(total_steps - 1):
                 # Get input at timestep k: [1, 1, 6]
                 input_k = features_autoreg[k:k+1, :].unsqueeze(0)  # [1, 1, 6]
-                # Use predicted value (auto-regressive)
-                input_k[0, 0, 5] = pred_y_norm[k]  # Y(k) = predicted value
+                # Use predicted value (auto-regressive) or true value (teacher forcing)
+                if tf_inference:
+                    input_k[0, 0, 5] = y_norm[k]  # Y(k) = true value (teacher forcing)
+                else:
+                    input_k[0, 0, 5] = pred_y_norm[k]  # Y(k) = predicted value (auto-regressive)
                 
                 # Forward pass
                 if gru1_hidden is None:
@@ -1178,8 +1216,14 @@ def inference_gru_tf(
                 pred_delta = preds_seq[0, 0, 0].item()
                 
                 # Update predicted Y(k+1)
-                pred_y_norm[k + 1] = pred_y_norm[k] + pred_delta
-                features_autoreg[k + 1, 5] = pred_y_norm[k + 1]
+                if tf_inference:
+                    # Teacher forcing: use true value as base
+                    pred_y_norm[k + 1] = y_norm[k] + pred_delta
+                    features_autoreg[k + 1, 5] = y_norm[k + 1]  # Use true value (teacher forcing)
+                else:
+                    # Auto-regressive: use predicted value as base
+                    pred_y_norm[k + 1] = pred_y_norm[k] + pred_delta
+                    features_autoreg[k + 1, 5] = pred_y_norm[k + 1]  # Use predicted value (auto-regressive)
             
             # Calculate RMSE (exclude first timestep)
             if total_steps > 1:
